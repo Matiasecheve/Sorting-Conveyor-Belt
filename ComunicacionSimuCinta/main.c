@@ -72,6 +72,8 @@
  */
 #include "Protocol_UNER.h"
 #include "dBounce.h"
+#include "SG90.h"
+#include "HCSR04.h"
 
 /* ============================================================
  * CONSTANTES GLOBALES
@@ -253,6 +255,10 @@ uint8_t lastboxtype = 0;
 // Variables de resguardo para el traspaso entre zonas
 volatile uint8_t last_box_Q1 = 0, last_box_Q2 = 0;
 
+/* Declaracion de actuadores*/
+SG90_t Servo[3];
+
+
 /* Manejo del debounce de los botones */
 
 debounce_t StartBotton = {
@@ -287,7 +293,7 @@ void HandleQueue() {
             Queue0[MaxQueue - 1 - Qelements0] = lastboxtype;
             Qelements0++;
             Ev.box_entry_active = 0;
-            //DebugQueues();
+            DebugQueues();
         }
     }
 
@@ -297,7 +303,7 @@ void HandleQueue() {
             if (Queue0[MaxQueue - 1] == config_salidas[0]) {
                 Actuator[0].state = ACT_EXTENDING;
                 Actuator[0].timestamp_ms = tick_ms;
-                FireActuator(0, 1);
+				FireActuator(0,1);
             } else {
                 // PASO DE ESTAFETA: De zona 0 a zona 1
                 last_box_Q1 = Queue0[MaxQueue - 1];
@@ -366,19 +372,19 @@ void HandleQueue() {
     if (Ev.movQ0) {
         static uint8_t i0 = 1;
         Queue0[MaxQueue - i0] = Queue0[MaxQueue - i0 - 1];
-        if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; /*DebugQueues();*/ }
+        if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; DebugQueues(); }
     }
 
     if (Ev.movQ1) {
         static uint8_t i1 = 1;
         Queue1[MaxQueue - i1] = Queue1[MaxQueue - i1 - 1];
-        if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; /*DebugQueues();*/ }
+        if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; DebugQueues(); }
     }
 
     if (Ev.movQ2) {
         static uint8_t i2 = 1;
         Queue2[MaxQueue - i2] = Queue2[MaxQueue - i2 - 1];
-        if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; /*DebugQueues();*/ }
+        if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; DebugQueues(); }
     }
 }
 
@@ -419,7 +425,15 @@ void HandleTX(void) {
  */
 void FireActuator(uint8_t outNum, uint8_t extend) {
     if (outNum > 2) return;
-
+	
+	//Como el servo esta al revez patea en 0 y retrae a 120 pero la lógica es la misma. 
+	
+	if (extend) {
+		SG90_SetAngle(&Servo[outNum], 0); // Patear
+		} else {
+		SG90_SetAngle(&Servo[outNum], 130);  // Retraer
+	}
+	
     uint8_t mask = (1 << outNum);
     uint8_t pl[2];
     pl[0] = mask;
@@ -434,8 +448,8 @@ void FireActuator(uint8_t outNum, uint8_t extend) {
         TxSendString("\r\n");
     }*/
 
-    PORTC |= (1 << PC1);
-}
+    //PORTC |= (1 << PC1);
+}	
 
 /*
  * HandleActuators — Máquina de estados para los 3 actuadores.
@@ -443,6 +457,7 @@ void FireActuator(uint8_t outNum, uint8_t extend) {
  * Usa tick_ms para medir los 150 ms de transición.
  */
 void HandleActuators(void) {
+	
     for (uint8_t i = 0; i < 3; i++) {
         switch (Actuator[i].state) {
 
@@ -456,7 +471,7 @@ void HandleActuators(void) {
                     Actuator[i].state = ACT_RETRACTING;
                     Actuator[i].timestamp_ms = tick_ms;
                     FireActuator(i, 0); // Orden de retracción física
-
+					
                     /* --- MENSAJE DE DEBUG PARA HÉRCULES --- */
                     /*
                     TxSendString("<<< RETRAYENDO BRAZO: ");
@@ -850,10 +865,11 @@ void InitUART0(void) {
 void InitPort(void) {
     /* PB5 — Heartbeat LED (Salida) */
     DDRB |= (1 << PB5);
-
+	
     /* PC0 y PC1 como salidas (LEDs de estado y actuadores) */
     DDRC |= (1 << PC0) | (1 << PC1);
     PORTC &= ~((1 << PC0) | (1 << PC1));
+	
 
     /* --- CONFIGURACIÓN BOTONES / ENTRADAS --- */
     /* 1. Configurar PC2, PC3 y PC4 como entradas (DDR = 0) */
@@ -861,6 +877,9 @@ void InitPort(void) {
 
     /* 2. Activar Pull-ups internas (PORT = 1 mientras DDR = 0) */
     PORTC |= (1 << PC2) | (1 << PC3) | (1 << PC4);
+	
+	/* Configurar los puertos de los servos */
+	DDRD |= (1 << PD2) | (1 << PD3) | (1 << PD4);
 }
 
 /*
@@ -969,9 +988,21 @@ int main(void) {
     config_salidas[0] = 0;
     config_salidas[1] = 0;
     config_salidas[2] = 0;
-
+	
+	/* ============================================================
+     * INICIALIZAR LOS SERVOS 
+     * ============================================================ */
+    SG90_Init(&Servo[0], &PORTD, PD2);
+    SG90_Init(&Servo[1], &PORTD, PD3);
+    SG90_Init(&Servo[2], &PORTD, PD4);
+	
+	for(uint8_t i = 0; i<=2; i++){
+		SG90_SetAngle(&Servo[i], 130);
+	}
+	
     sei();
-
+	
+	
     SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
 
     /* ============================================================
@@ -980,10 +1011,8 @@ int main(void) {
     while (1) {
 
         // --- TASKS ---
-
         Protocol_HandleUART();     /* Procesa bytes del buffer RX y llama a Protocol_DecodeCMD */
         HandlePendingReplies();    /* Despacha respuestas TX diferidas por los callbacks RX      */
-        HandleTX();                /* Stub — el vaciado real lo hace la ISR USART_UDRE_vect      */
         HandleActuators();
         HandleQueue();
         UpdateDebugLEDs();

@@ -1,53 +1,67 @@
 #include "SG90.h"
+#include <avr/interrupt.h>
 
-void SG90_Init(SG90_t *servo, volatile uint8_t *port, uint8_t pin, toggle_ptr_t t_func, volatile uint16_t *timer_reg) {
+#define MAX_SERVOS 3
+#define CYCLE_TICKS 40000 // 20ms con prescaler 8 @ 16MHz
+
+static SG90_t* servo_array[MAX_SERVOS];
+static uint8_t servo_count = 0;
+
+void SG90_Init(SG90_t *servo, volatile uint8_t *port, uint8_t pin) {
 	servo->port = port;
 	servo->pin = pin;
-	servo->toggle_func = t_func;
-	servo->tcnt_reg = timer_reg; // Conectamos directo a &TCNT1
+	servo->target_pulse_ticks = 1088; // Reposo
 
-	servo->target_pulse_ticks = 1088;
-	
-	servo->state = SG90_IDLE;
-	servo->last_tick = 0;
-	
-	*(servo->port) &= ~(1 << servo->pin); // Forzamos LOW para la FSM
+	*(servo->port) &= ~(1 << servo->pin); // Forzar LOW
+
+	if (servo_count < MAX_SERVOS) {
+		servo_array[servo_count] = servo;
+		servo_count++;
+	}
+
+	// Si es el primer servo inicializado, encendemos el motor de interrupciones
+	if (servo_count == 1) {
+		TIMSK1 |= (1 << OCIE1A); // Habilitar ISR de Comparación A en Timer1
+		OCR1A = TCNT1 + 100;     // Disparar la primera interrupción en 50µs
+	}
 }
 
 void SG90_SetAngle(SG90_t *servo, uint8_t angle) {
 	if (angle > 180) angle = 180;
-	
-	// Ecuación entera: 1088 ticks + (Angulo * Delta / 180)
 	servo->target_pulse_ticks = 1088 + (((uint32_t)angle * 3712UL) / 180UL);
 }
 
-void SG90_Process(SG90_t *servo) {
-	// Leemos el hardware directamente
-	uint16_t now = *(servo->tcnt_reg);
-	
-	// Al ser enteros de 16 bits sin signo, el desbordamiento (rollover)
-	// matemático se maneja solo y da el delta exacto de tiempo.
-	uint16_t delta = now - servo->last_tick;
+/* --- MOTOR DE PWM MULTIPLEXADO --- */
+ISR(TIMER1_COMPA_vect) {
+	static uint8_t isr_state = 0;
+	static uint16_t cycle_ticks = 0;
 
-	switch (servo->state) {
-		case SG90_IDLE:
-		servo->toggle_func(servo->port, servo->pin); // Pasa a HIGH
-		servo->last_tick = now;
-		servo->state = SG90_PULSE_HIGH;
-		break;
+	if (servo_count == 0) return;
 
-		case SG90_PULSE_HIGH:
-		if (delta >= servo->target_pulse_ticks) {
-			servo->toggle_func(servo->port, servo->pin); // Pasa a LOW
-			servo->state = SG90_PULSE_LOW;
+	uint8_t servo_idx = isr_state / 2;
+
+	if (isr_state < (servo_count * 2)) {
+		if ((isr_state & 0x01) == 0) {
+			// ESTADO PAR: Encender Pin
+			*(servo_array[servo_idx]->port) |= (1 << servo_array[servo_idx]->pin);
+			uint16_t ticks = servo_array[servo_idx]->target_pulse_ticks;
+			OCR1A += ticks;
+			cycle_ticks += ticks;
+			} else {
+			// ESTADO IMPAR: Apagar Pin
+			*(servo_array[servo_idx]->port) &= ~(1 << servo_array[servo_idx]->pin);
+			OCR1A += 100; // Tiempo muerto de 50µs entre servos para aislar ruido
+			cycle_ticks += 100;
 		}
-		break;
-
-		case SG90_PULSE_LOW:
-		// 20ms = 40.000 ticks a 2MHz
-		if (delta >= 40000) {
-			servo->state = SG90_IDLE;
+		isr_state++;
+		} else {
+		// Terminó la secuencia de los 3 servos. Rellenar el resto de los 20ms.
+		if (cycle_ticks < CYCLE_TICKS) {
+			OCR1A += (CYCLE_TICKS - cycle_ticks);
+			} else {
+			OCR1A += 100; // Failsafe matemático
 		}
-		break;
+		isr_state = 0;
+		cycle_ticks = 0;
 	}
 }

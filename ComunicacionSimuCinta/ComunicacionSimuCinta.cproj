@@ -139,6 +139,12 @@
     <Compile Include="dBounce.h">
       <SubType>compile</SubType>
     </Compile>
+    <Compile Include="HCSR04.c">
+      <SubType>compile</SubType>
+    </Compile>
+    <Compile Include="HCSR04.h">
+      <SubType>compile</SubType>
+    </Compile>
     <Compile Include="main.c">
       <SubType>compile</SubType>
     </Compile>
@@ -146,6 +152,12 @@
       <SubType>compile</SubType>
     </Compile>
     <Compile Include="Protocol_UNER.h">
+      <SubType>compile</SubType>
+    </Compile>
+    <Compile Include="SG90.c">
+      <SubType>compile</SubType>
+    </Compile>
+    <Compile Include="SG90.h">
       <SubType>compile</SubType>
     </Compile>
   </ItemGroup>

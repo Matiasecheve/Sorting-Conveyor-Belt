@@ -121,14 +121,6 @@ ISR(USART_UDRE_vect) {
          * volvera a disparar y los enviara. Si no quedan, la proxima
          * dispara con ir == iw y entra al else.
          */
-    } else {
-        /*
-         * Buffer vacio: deshabilitar UDRIE AHORA, dentro de la ISR,
-         * antes de retornar. Esto es atomico por naturaleza (estamos
-         * dentro de una ISR, las interrupciones estan inhibidas).
-         * No hay race condition posible en este punto.
-         */
-        UCSR0B &= ~(1 << UDRIE0);
     }
 }
 
