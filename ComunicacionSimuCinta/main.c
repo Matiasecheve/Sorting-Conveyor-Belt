@@ -518,9 +518,7 @@ void Cmd_AckAlive(void) {
  */
 void Cmd_ConfigCinta(void) {
     /*
-     * Guardamos la config y levantamos el flag de confirmación.
-     * El 0x50 de vuelta se envía desde HandlePendingReplies para
-     * evitar la misma condición de carrera que en Cmd_AckAlive.
+     * Guardamos la config 
      */
     config_salidas[0] = Rx.payload[1];
     config_salidas[1] = Rx.payload[2];
@@ -534,7 +532,6 @@ void Cmd_ConfigCinta(void) {
  */
 void Cmd_AckStop(void) {
     sys_state = ST_READY;
-    Ev.reply_send_stop = 1;    /* HandlePendingReplies enviará 0x51 */
 }
 
 /*
@@ -545,8 +542,6 @@ void Cmd_AckStop(void) {
 void Cmd_AckReset(void) {
     if (Rx.payload[0] == 0x0D) {
         sys_state = ST_IDLE;
-        Ev.reply_send_reset = 1;   /* HandlePendingReplies enviará 0x53 */
-        //DoResetBotton();
     } else {
         Ev.reply_error = 1;
     }
