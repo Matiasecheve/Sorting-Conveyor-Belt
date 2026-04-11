@@ -50,25 +50,37 @@
  * =============================================================================
  */
 
-#define F_CPU 16000000UL
-
-#include <avr/io.h>
+/* ============================================================
+ * INCLUDES
+ * ============================================================ */
 #include <avr/interrupt.h>
-
 #include <string.h>
 #include <stdlib.h>
 
+/*
+ * Protocol_UNER.h ya incluye:
+ *   - #define F_CPU 16000000UL
+ *   - <avr/io.h>, <stdint.h>, <stdbool.h>, <stddef.h>
+ *   - Definiciones de BUFSIZE, MASK, MAX_PAYLOAD
+ *   - Enums: rx_state_t  (WAIT_U … GET_CKS)
+ *   - Structs: ring_buf_t, protocol_rx_t, protocol_tx_t
+ *   - Tipos: cmd_handler_t, protocol_command_t
+ *   - Extern: Rx (protocol_rx_t), Tx (protocol_tx_t)
+ *   - Prototipos de Protocol_Init, Protocol_HandleUART,
+ *     Protocol_TxAddChar, Protocol_TxSendString,
+ *     Protocol_SendSimuCMD, Protocol_DecodeCMD
+ */
+#include "Protocol_UNER.h"
 #include "dBounce.h"
 
 /* ============================================================
  * CONSTANTES GLOBALES
- * ============================================================ */
-#define BUFSIZE 256  
-#define MASK            (BUFSIZE - 1)
-#define MAX_PAYLOAD     32
+ * ============================================================
+ * BUFSIZE, MASK y MAX_PAYLOAD ya vienen de Protocol_UNER.h    */
 #define ACT_EXTEND_MS   160     /* Margen sobre los 150 ms del actuador   */
 #define DEBUG_FAST_MS   100     /* Periodo toggle PA0 en ST_RUNNING       */
 #define MaxQueue        10      /* Maximo número de cajas en cinta        */
+
 /* ============================================================
  * ENUMS
  * ============================================================ */
@@ -80,17 +92,10 @@ typedef enum {
     ST_ERROR        /* Fallo o Reset                                      */
 } system_state_t;
 
-typedef enum {
-    WAIT_U,
-    WAIT_N,
-    WAIT_E,
-    WAIT_R,
-    GET_LEN,
-    WAIT_DP,
-    GET_CMD,
-    GET_PAYLOAD,
-    GET_CKS
-} rx_state_t;
+/*
+ * rx_state_t (WAIT_U … GET_CKS) ya está definido en Protocol_UNER.h.
+ * No se redefine aquí para evitar conflictos de compilación.
+ */
 
 /* Estados del actuador */
 typedef enum {
@@ -101,30 +106,9 @@ typedef enum {
 
 /* ============================================================
  * ESTRUCTURAS
- * ============================================================ */
-
-typedef struct {
-    uint8_t buf[BUFSIZE];
-    volatile uint8_t iw;
-    volatile uint8_t ir;
-} _sRingBuf;
-
-typedef struct {
-    _sRingBuf  rBuf;
-    rx_state_t hdrst;
-    uint8_t    cks;
-    uint8_t    nBytes;
-    uint8_t    payloadLen;
-    uint8_t    current_cmd;
-    uint8_t    payload[MAX_PAYLOAD];
-    uint8_t    payload_idx;
-} _sRx;
-
-typedef struct {
-    _sRingBuf rBuf;
-    const char *pMsg;
-} _sTx;
-
+ * ============================================================
+ * ring_buf_t, protocol_rx_t y protocol_tx_t vienen de Protocol_UNER.h.
+ * Solo se definen aquí las estructuras propias de la aplicación.  */
 
 /* Estado de cada actuador */
 typedef struct {
@@ -132,30 +116,47 @@ typedef struct {
     uint32_t         timestamp_ms;   /* Momento en que comenzó el estado actual */
 } _sActuator;
 
-typedef void (*cmd_handler_t)(void);
-
-typedef struct {
-    uint8_t       cmd_id;
-    cmd_handler_t execute;
-} _sCommand;
+/*
+ * Tabla de comandos — usa los tipos de Protocol_UNER.h:
+ *   cmd_handler_t     ? void (*)(void)
+ *   protocol_command_t ? { uint8_t cmd_id; cmd_handler_t execute; }
+ * Se crea un alias local _sCommand para no cambiar ninguna referencia
+ * existente en el código.
+ */
+typedef protocol_command_t _sCommand;
 
 /* ============================================================
  * BANDERAS DE EVENTOS (FLAGS)
  * ============================================================ */
 typedef struct {
-	/* --- Eventos de Clasificación (Los que SI usás) --- */
-	volatile uint8_t box_entry_active; // Entrada desde el medidor
-	volatile uint8_t ir0_active;       // Sensores físicos
-	volatile uint8_t ir1_active;
-	volatile uint8_t ir2_active;
+    /* --- Eventos de Clasificación (Los que SI usás) --- */
+    volatile uint8_t box_entry_active; // Entrada desde el medidor
+    volatile uint8_t ir0_active;       // Sensores físicos
+    volatile uint8_t ir1_active;
+    volatile uint8_t ir2_active;
 
-	/* --- Control de Tareas Multitask --- */
-	volatile uint8_t movQ0;            // Semáforos de movimiento
-	volatile uint8_t movQ1;
-	volatile uint8_t movQ2;
-	
-	volatile uint8_t box_entry_Q1;     // Sala de espera entre zonas
-	volatile uint8_t box_entry_Q2;
+    /* --- Control de Tareas Multitask --- */
+    volatile uint8_t movQ0;            // Semáforos de movimiento
+    volatile uint8_t movQ1;
+    volatile uint8_t movQ2;
+
+    volatile uint8_t box_entry_Q1;     // Sala de espera entre zonas
+    volatile uint8_t box_entry_Q2;
+    /*
+     * --- Respuestas TX pendientes ---
+     * Los callbacks de comandos NO deben llamar SendSimuCMD directamente
+     * porque se ejecutan dentro de Protocol_HandleUART (loop principal con
+     * interrupciones activas). Si el simulador Qt responde inmediatamente,
+     * la nueva trama entra por ISR RX mientras todavía estamos procesando
+     * la anterior, saturando el pipeline.
+     * Solución: el callback solo levanta un flag; HandlePendingReplies
+     * despacha la respuesta en la siguiente iteración del loop principal,
+     * cuando HandleUART ya terminó y el buffer RX está libre.
+     */
+    volatile uint8_t reply_send_start;   /* 0x50 ? arrancar cinta           */
+    volatile uint8_t reply_send_stop;    /* 0x51 ? confirmar detención       */
+    volatile uint8_t reply_send_reset;   /* 0x53 ? confirmar reset           */
+    volatile uint8_t reply_error;        /* transitar a ST_ERROR             */
 } _sEventFlags;
 
 /* ============================================================
@@ -166,23 +167,24 @@ void InitTimer0(void);
 void InitTimer1(void);
 void InitPort(void);
 
-/* TX */
-void TxAddChar(uint8_t data);
-void TxSendString(const char *msg);
+/*
+ * TX — se mantienen los nombres internos como wrappers inline
+ * que delegan en las funciones de la librería.
+ */
 void HandleTX(void);
-void SendSimuCMD(uint8_t cmd, uint8_t *payload, uint8_t len);
 
 /* RX / Protocolo */
-void HandleUART(void);
 void DecodeCMD(uint8_t cmd);
 
 /* Lógica de clasificación */
-//void ClassifyBox(uint8_t outNum);
 void FireActuator(uint8_t outNum, uint8_t extend);
 void HandleActuators(void);
 
 /* Cola */
 void HandleQueue();
+
+/* Respuestas TX diferidas */
+void HandlePendingReplies(void);
 
 /* Debug */
 void UpdateDebugLEDs(void);
@@ -191,17 +193,27 @@ void DebugQueues(void);
 /* Misc */
 void TogglePin(volatile uint8_t *port, uint8_t pin);
 
-/* Hardware */ 
+/* Hardware */
 void DoStartBotton();
 void DoStopBotton();
 void DoResetBotton();
 
+/* ============================================================
+ * MACROS DE COMPATIBILIDAD
+ * -----------------------------------------------------------------------------
+ * El código de aplicación usaba TxAddChar / TxSendString / SendSimuCMD
+ * directamente. Estos macros redirigen de forma transparente a la librería
+ * sin tener que renombrar cada llamada en todo el archivo.
+ * ============================================================ */
+#define TxAddChar(d)            Protocol_TxAddChar(d)
+#define TxSendString(s)         Protocol_TxSendString(s)
+#define SendSimuCMD(cmd, pl, l) Protocol_SendSimuCMD(cmd, pl, l)
 
 /* ============================================================
  * VARIABLES GLOBALES
- * ============================================================ */
-_sRx         Rx;
-_sTx         Tx;
+ * ============================================================
+ * Rx y Tx son extern protocol_rx_t / protocol_tx_t declarados
+ * en Protocol_UNER.h y definidos en Protocol_UNER.c            */
 
 _sActuator   Actuator[3];
 
@@ -210,6 +222,7 @@ volatile uint32_t       tick_ms     = 0;    /* Incrementado cada 2ms por ISR Tim
 
 /* ovf_counter_hb para heartbeat Timer1 */
 uint8_t ovf_counter_hb = 0;
+
 /*
  * config_salidas[n] = tipo de caja asignado a la salida n (6, 8 o 10)
  * Recibido en el payload del comando 0x50:
@@ -220,16 +233,13 @@ uint8_t ovf_counter_hb = 0;
  */
 uint8_t config_salidas[3];
 
-/* Última caja medida recibida (0x5F), guardada en la cola */
-
 /* Timestamp para debug LED */
 uint32_t debug_led_ts = 0;
 
-/* Instancia Global de eventos */ 
-_sEventFlags Ev; 
+/* Instancia Global de eventos */
+_sEventFlags Ev;
 
 /* Manejo de Queue */
-
 uint8_t Queue0[MaxQueue];
 uint8_t Queue1[MaxQueue];
 uint8_t Queue2[MaxQueue];
@@ -238,8 +248,7 @@ uint8_t Qelements0 = 0;
 uint8_t Qelements1 = 0;
 uint8_t Qelements2 = 0;
 
-uint8_t lastboxtype = 0; 
-
+uint8_t lastboxtype = 0;
 
 // Variables de resguardo para el traspaso entre zonas
 volatile uint8_t last_box_Q1 = 0, last_box_Q2 = 0;
@@ -247,210 +256,148 @@ volatile uint8_t last_box_Q1 = 0, last_box_Q2 = 0;
 /* Manejo del debounce de los botones */
 
 debounce_t StartBotton = {
-	.pressed_count = 0,
-	.prev_state = 1,
-	.onPress = DoStartBotton,
-	.onRelease = NULL
+    .pressed_count = 0,
+    .prev_state = 1,
+    .onPress = DoStartBotton,
+    .onRelease = NULL
 };
 
 debounce_t StopBotton = {
-	.pressed_count = 0,
-	.prev_state = 1,
-	.onPress = DoStopBotton,
-	.onRelease = NULL
+    .pressed_count = 0,
+    .prev_state = 1,
+    .onPress = DoStopBotton,
+    .onRelease = NULL
 };
 
 debounce_t ResetBotton = {
-	.pressed_count = 0,
-	.prev_state = 1,
-	.onPress = DoResetBotton,
-	.onRelease = NULL
+    .pressed_count = 0,
+    .prev_state = 1,
+    .onPress = DoResetBotton,
+    .onRelease = NULL
 };
+
 /* ============================================================
-							QUEUE
+ *                          QUEUE
  * ============================================================ */
 
 void HandleQueue() {
-	// --- TRAMO 0 (Entrada desde el Medidor 0x5F) ---
-	if (Ev.box_entry_active && !Ev.movQ0) {
-		if (Qelements0 < MaxQueue) {
-			Queue0[MaxQueue - 1 - Qelements0] = lastboxtype;
-			Qelements0++;
-			Ev.box_entry_active = 0;
-			//DebugQueues();
-		}
-	}
+    // --- TRAMO 0 (Entrada desde el Medidor 0x5F) ---
+    if (Ev.box_entry_active && !Ev.movQ0) {
+        if (Qelements0 < MaxQueue) {
+            Queue0[MaxQueue - 1 - Qelements0] = lastboxtype;
+            Qelements0++;
+            Ev.box_entry_active = 0;
+            //DebugQueues();
+        }
+    }
 
-	if (Ev.ir0_active && !Ev.movQ0) {
-		Ev.ir0_active = 0;
-		if (Qelements0 > 0) {
-			if (Queue0[MaxQueue - 1] == config_salidas[0]) {
-				Actuator[0].state = ACT_EXTENDING;
-				Actuator[0].timestamp_ms = tick_ms;
-				FireActuator(0, 1);
-				} else {
-				// PASO DE ESTAFETA: De zona 0 a zona 1
-				last_box_Q1 = Queue0[MaxQueue - 1];
-				Ev.box_entry_Q1 = 1;
-			}
-			Queue0[MaxQueue - 1] = 0;
-			Qelements0--;
-			Ev.movQ0 = 1; // Inicia tarea de desplazamiento en Q0
-		}
-	}
+    if (Ev.ir0_active && !Ev.movQ0) {
+        Ev.ir0_active = 0;
+        if (Qelements0 > 0) {
+            if (Queue0[MaxQueue - 1] == config_salidas[0]) {
+                Actuator[0].state = ACT_EXTENDING;
+                Actuator[0].timestamp_ms = tick_ms;
+                FireActuator(0, 1);
+            } else {
+                // PASO DE ESTAFETA: De zona 0 a zona 1
+                last_box_Q1 = Queue0[MaxQueue - 1];
+                Ev.box_entry_Q1 = 1;
+            }
+            Queue0[MaxQueue - 1] = 0;
+            Qelements0--;
+            Ev.movQ0 = 1; // Inicia tarea de desplazamiento en Q0
+        }
+    }
 
-	// --- TRAMO 1 (Entrada desde Zona 0) ---
-	if (Ev.box_entry_Q1 && !Ev.movQ1) {
-		if (Qelements1 < MaxQueue) {
-			Queue1[MaxQueue - 1 - Qelements1] = last_box_Q1;
-			Qelements1++;
-			Ev.box_entry_Q1 = 0;
-		}
-	}
+    // --- TRAMO 1 (Entrada desde Zona 0) ---
+    if (Ev.box_entry_Q1 && !Ev.movQ1) {
+        if (Qelements1 < MaxQueue) {
+            Queue1[MaxQueue - 1 - Qelements1] = last_box_Q1;
+            Qelements1++;
+            Ev.box_entry_Q1 = 0;
+        }
+    }
 
-	if (Ev.ir1_active && !Ev.movQ1) {
-		Ev.ir1_active = 0;
-		if (Qelements1 > 0) {
-			if (Queue1[MaxQueue - 1] == config_salidas[1]) {
-				Actuator[1].state = ACT_EXTENDING;
-				Actuator[1].timestamp_ms = tick_ms;
-				FireActuator(1, 1);
-				} else {
-				// PASO DE ESTAFETA: De zona 1 a zona 2
-				last_box_Q2 = Queue1[MaxQueue - 1];
-				Ev.box_entry_Q2 = 1;
-			}
-			Queue1[MaxQueue - 1] = 0;
-			Qelements1--;
-			Ev.movQ1 = 1; // Inicia tarea de desplazamiento en Q1
-		}
-	}
+    if (Ev.ir1_active && !Ev.movQ1) {
+        Ev.ir1_active = 0;
+        if (Qelements1 > 0) {
+            if (Queue1[MaxQueue - 1] == config_salidas[1]) {
+                Actuator[1].state = ACT_EXTENDING;
+                Actuator[1].timestamp_ms = tick_ms;
+                FireActuator(1, 1);
+            } else {
+                // PASO DE ESTAFETA: De zona 1 a zona 2
+                last_box_Q2 = Queue1[MaxQueue - 1];
+                Ev.box_entry_Q2 = 1;
+            }
+            Queue1[MaxQueue - 1] = 0;
+            Qelements1--;
+            Ev.movQ1 = 1; // Inicia tarea de desplazamiento en Q1
+        }
+    }
 
-	// --- TRAMO 2 (Entrada desde Zona 1 y Descarte Final) ---
-	if (Ev.box_entry_Q2 && !Ev.movQ2) {
-		if (Qelements2 < MaxQueue) {
-			Queue2[MaxQueue - 1 - Qelements2] = last_box_Q2;
-			Qelements2++;
-			Ev.box_entry_Q2 = 0;
-		}
-	}
+    // --- TRAMO 2 (Entrada desde Zona 1 y Descarte Final) ---
+    if (Ev.box_entry_Q2 && !Ev.movQ2) {
+        if (Qelements2 < MaxQueue) {
+            Queue2[MaxQueue - 1 - Qelements2] = last_box_Q2;
+            Qelements2++;
+            Ev.box_entry_Q2 = 0;
+        }
+    }
 
-	if (Ev.ir2_active && !Ev.movQ2) {
-		Ev.ir2_active = 0;
-		if (Qelements2 > 0) {
-			if (Queue2[MaxQueue - 1] == config_salidas[2]) {
-				Actuator[2].state = ACT_EXTENDING;
-				Actuator[2].timestamp_ms = tick_ms;
-				FireActuator(2, 1);
-			}
-			// Para Queue2, si no se patea, simplemente se elimina (descarte)
-			// No hay Queue3, así que el lugar queda vacío.
-			Queue2[MaxQueue - 1] = 0;
-			Qelements2--;
-			Ev.movQ2 = 1; // Inicia tarea de desplazamiento en Q2
-		}
-	}
+    if (Ev.ir2_active && !Ev.movQ2) {
+        Ev.ir2_active = 0;
+        if (Qelements2 > 0) {
+            if (Queue2[MaxQueue - 1] == config_salidas[2]) {
+                Actuator[2].state = ACT_EXTENDING;
+                Actuator[2].timestamp_ms = tick_ms;
+                FireActuator(2, 1);
+            }
+            // Para Queue2, si no se patea, simplemente se elimina (descarte)
+            // No hay Queue3, así que el lugar queda vacío.
+            Queue2[MaxQueue - 1] = 0;
+            Qelements2--;
+            Ev.movQ2 = 1; // Inicia tarea de desplazamiento en Q2
+        }
+    }
 
-	// --- TAREAS DE DESPLAZAMIENTO (SHIFTING SERIALIZADO) ---)
-	
-	if (Ev.movQ0) {
-		static uint8_t i0 = 1;
-		Queue0[MaxQueue - i0] = Queue0[MaxQueue - i0 - 1];
-		if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; /*DebugQueues();*/ }
-	}
+    // --- TAREAS DE DESPLAZAMIENTO (SHIFTING SERIALIZADO) ---
 
-	if (Ev.movQ1) {
-		static uint8_t i1 = 1;
-		Queue1[MaxQueue - i1] = Queue1[MaxQueue - i1 - 1];
-		if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; /*DebugQueues();*/ }
-	}
+    if (Ev.movQ0) {
+        static uint8_t i0 = 1;
+        Queue0[MaxQueue - i0] = Queue0[MaxQueue - i0 - 1];
+        if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; /*DebugQueues();*/ }
+    }
 
-	if (Ev.movQ2) {
-		static uint8_t i2 = 1;
-		Queue2[MaxQueue - i2] = Queue2[MaxQueue - i2 - 1];
-		if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; /*DebugQueues();*/ }
-	}
+    if (Ev.movQ1) {
+        static uint8_t i1 = 1;
+        Queue1[MaxQueue - i1] = Queue1[MaxQueue - i1 - 1];
+        if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; /*DebugQueues();*/ }
+    }
+
+    if (Ev.movQ2) {
+        static uint8_t i2 = 1;
+        Queue2[MaxQueue - i2] = Queue2[MaxQueue - i2 - 1];
+        if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; /*DebugQueues();*/ }
+    }
 }
 
 /* ============================================================
  * IMPLEMENTACIÓN — TX
+ * -----------------------------------------------------------------------------
+ * Las funciones TxAddChar, TxSendString y SendSimuCMD han sido
+ * reemplazadas por los macros de compatibilidad definidos arriba,
+ * que delegan directamente en Protocol_TxAddChar,
+ * Protocol_TxSendString y Protocol_SendSimuCMD respectivamente.
+ *
+ * HandleTX: en la versión original gestionaba el envío char a char
+ * del pMsg pendiente. La librería gestiona el vaciado del ring buffer
+ * íntegramente mediante la ISR USART_UDRE_vect, por lo que HandleTX
+ * queda como stub vacío para no romper la llamada en el loop principal.
  * ============================================================ */
-
-void TxAddChar(uint8_t data) {
-    uint8_t next_iw = (Tx.rBuf.iw + 1) & MASK;
-    if (next_iw != Tx.rBuf.ir) {
-        Tx.rBuf.buf[Tx.rBuf.iw] = data;
-        Tx.rBuf.iw = next_iw;
-        UCSR0B |= (1 << UDRIE0);   /* Habilita interrupción UDRE para vaciar buffer */
-    }
-}
-
-/*
- * TxSendString — Agrega una cadena ASCII directamente al ring buffer de TX.
- * Usado para respuestas de texto plano (debug, ACKs de texto).
- */
-void TxSendString(const char *msg) {
-    while (*msg) {
-        TxAddChar((uint8_t)*msg++);
-    }
-}
-
-/*
- * HandleTX — Vacía el pMsg pendiente (modo streaming char a char).
- * Se llama desde el loop principal. Permite enviar strings largos
- * sin bloquear el CPU.
- */
 void HandleTX(void) {
-    if (Tx.pMsg == NULL) return;
-    if (*Tx.pMsg != '\0') {
-        uint8_t next_iw = (Tx.rBuf.iw + 1) & MASK;
-        if (next_iw != Tx.rBuf.ir) {
-            TxAddChar((uint8_t)*Tx.pMsg);
-            Tx.pMsg++;
-        }
-    } else {
-        Tx.pMsg = NULL;
-    }
-}
-
-/*
- * SendSimuCMD — Arma y envía una trama UNER completa al simulador.
- *
- * Formato de trama:
- *   [U][N][E][R][LEN][:][CMD][payload[0]...payload[len-1]][CKS]
- *
- * Donde:
- *   LEN = 1 (CMD) + len (bytes de payload)
- *   CKS = XOR de todos los bytes desde 'U' hasta el último payload
- *
- * @param cmd     Byte de comando a enviar (ej: 0xF0, 0x52)
- * @param payload Puntero al array de bytes del payload (puede ser NULL si len=0)
- * @param len     Cantidad de bytes de payload
- */
-void SendSimuCMD(uint8_t cmd, uint8_t *payload, uint8_t len) {
-	uint8_t header[] = { 'U', 'N', 'E', 'R' };
-	uint8_t length_byte = 2 + len; // Base 2 (Token + CMD)
-	uint8_t separator = ':';
-	uint8_t cks = 0;
-
-	// Checksum: XOR desde 'U' hasta el último byte del payload 
-	for (uint8_t i = 0; i < 4; i++) cks ^= header[i];
-	cks ^= length_byte;
-	cks ^= separator;
-	cks ^= cmd;
-	if(payload != NULL && len > 0) {
-		for (uint8_t i = 0; i < len; i++) cks ^= payload[i];
-	}
-
-	// Transmisión física
-	for (uint8_t i = 0; i < 4; i++) TxAddChar(header[i]);
-	TxAddChar(length_byte);
-	TxAddChar(separator);
-	TxAddChar(cmd);
-	if(payload != NULL && len > 0) {
-		for (uint8_t i = 0; i < len; i++) TxAddChar(payload[i]);
-	}
-	TxAddChar(cks);
+    /* El ring buffer de TX lo vacía la ISR USART_UDRE_vect.
+     * No se requiere acción adicional en el loop principal. */
 }
 
 /* ============================================================
@@ -471,23 +418,23 @@ void SendSimuCMD(uint8_t cmd, uint8_t *payload, uint8_t len) {
  * Ejemplo retraer  salida 1: boxType=0b010, armPos=0b000
  */
 void FireActuator(uint8_t outNum, uint8_t extend) {
-	if (outNum > 2) return;
+    if (outNum > 2) return;
 
-	uint8_t mask = (1 << outNum);
-	uint8_t pl[2];
-	pl[0] = mask;
-	pl[1] = extend ? mask : 0x00;
+    uint8_t mask = (1 << outNum);
+    uint8_t pl[2];
+    pl[0] = mask;
+    pl[1] = extend ? mask : 0x00;
 
-	SendSimuCMD(0x52, pl, 2);
+    SendSimuCMD(0x52, pl, 2);
 
-	/* --- MENSAJE DE DEBUG PARA HÉRCULES --- */
-	/*if (extend) {
-		TxSendString("\r\n>>> PATEANDO BRAZO: ");
-		TxAddChar(outNum + '0'); // Muestra 0, 1 o 2
-		TxSendString("\r\n");
-	}*/
-	
-	PORTC |= (1 << PC1);
+    /* --- MENSAJE DE DEBUG PARA HÉRCULES --- */
+    /*if (extend) {
+        TxSendString("\r\n>>> PATEANDO BRAZO: ");
+        TxAddChar(outNum + '0'); // Muestra 0, 1 o 2
+        TxSendString("\r\n");
+    }*/
+
+    PORTC |= (1 << PC1);
 }
 
 /*
@@ -505,19 +452,18 @@ void HandleActuators(void) {
 
             case ACT_EXTENDING:
                 /* Esperar ACT_EXTEND_MS ms y luego retraer */
-				if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
-					Actuator[i].state = ACT_RETRACTING;
-					Actuator[i].timestamp_ms = tick_ms;
-					FireActuator(i, 0); // Orden de retracción física
+                if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
+                    Actuator[i].state = ACT_RETRACTING;
+                    Actuator[i].timestamp_ms = tick_ms;
+                    FireActuator(i, 0); // Orden de retracción física
 
-					
-					/* --- MENSAJE DE DEBUG PARA HÉRCULES --- */
-					/*
-					TxSendString("<<< RETRAYENDO BRAZO: ");
-					TxAddChar(i + '0');
-					TxSendString("\r\n");
-					*/
-				}
+                    /* --- MENSAJE DE DEBUG PARA HÉRCULES --- */
+                    /*
+                    TxSendString("<<< RETRAYENDO BRAZO: ");
+                    TxAddChar(i + '0');
+                    TxSendString("\r\n");
+                    */
+                }
                 break;
 
             case ACT_RETRACTING:
@@ -548,16 +494,21 @@ void HandleActuators(void) {
  * por lo que respondemos encendiendo la cinta con 0x50.
  */
 void Cmd_AckAlive(void) {
-	// Verificamos el payload según el manual
-	if (Rx.payload[0] == 0x0D) {
-		sys_state = ST_READY; // Ahora sí, el micro sabe que hay alguien del otro lado
-		
-		// El paso lógico siguiente: Encender cinta (0x50)
-		SendSimuCMD(0x50, NULL, 0);
-		} else {
-		// Si responde otra cosa, es un error de protocolo
-		sys_state = ST_ERROR;
-	}
+    /*
+     * NO llamamos SendSimuCMD aquí. Este callback se ejecuta dentro de
+     * Protocol_HandleUART; si enviamos el 0x50 ahora, el simulador Qt
+     * puede responder con la trama de Config antes de que HandleUART
+     * termine, saturando el buffer RX y corrompiendo el estado de la
+     * máquina de estados del protocolo.
+     * Solución: levantar un flag y dejar que HandlePendingReplies
+     * despache el 0x50 en la próxima iteración del loop principal.
+     */
+    if (Rx.payload[0] == 0x0D) {
+        sys_state = ST_READY;
+        Ev.reply_send_start = 1;   /* HandlePendingReplies enviará 0x50 */
+    } else {
+        Ev.reply_error = 1;        /* HandlePendingReplies transitará a ST_ERROR */
+    }
 }
 
 /*
@@ -566,24 +517,24 @@ void Cmd_AckAlive(void) {
  * Acción: guardar configuración y transitar a ST_RUNNING.
  */
 void Cmd_ConfigCinta(void) {
-	config_salidas[0] = Rx.payload[1];
-	config_salidas[1] = Rx.payload[2];
-	config_salidas[2] = Rx.payload[3];
+    /*
+     * Guardamos la config y levantamos el flag de confirmación.
+     * El 0x50 de vuelta se envía desde HandlePendingReplies para
+     * evitar la misma condición de carrera que en Cmd_AckAlive.
+     */
+    config_salidas[0] = Rx.payload[1];
+    config_salidas[1] = Rx.payload[2];
+    config_salidas[2] = Rx.payload[3];
 
-	sys_state = ST_RUNNING;
-	
-	// AGREGAR ESTA LÍNEA: Avisar a la PC que la cinta arrancó
-	SendSimuCMD(0x50, NULL, 0);
+    sys_state = ST_RUNNING;
 }
 
 /*
  * Cmd_AckStop — ACK de detención (0x51 SIMU?MICRO, payload=0x0D).
  */
 void Cmd_AckStop(void) {
-	sys_state = ST_READY; // El micro cambia su estado interno
-	
-	// Le enviamos el comando 0x51 de vuelta a la PC como confirmación
-	SendSimuCMD(0x51, NULL, 0);
+    sys_state = ST_READY;
+    Ev.reply_send_stop = 1;    /* HandlePendingReplies enviará 0x51 */
 }
 
 /*
@@ -592,16 +543,13 @@ void Cmd_AckStop(void) {
  * payload[0] = 0x0A ? no pudo resetearse
  */
 void Cmd_AckReset(void) {
-	if (Rx.payload[0] == 0x0D) {
-		sys_state = ST_IDLE;
-		
-		// --- AGREGAR ESTA LÍNEA ---
-		// Avisamos a la PC que el reset fue exitoso
-		SendSimuCMD(0x53, NULL, 0);
-		//DoResetBotton();
-		} else {
-		sys_state = ST_ERROR;
-	}
+    if (Rx.payload[0] == 0x0D) {
+        sys_state = ST_IDLE;
+        Ev.reply_send_reset = 1;   /* HandlePendingReplies enviará 0x53 */
+        //DoResetBotton();
+    } else {
+        Ev.reply_error = 1;
+    }
 }
 
 /*
@@ -636,22 +584,22 @@ void Cmd_AckVelocidad(void) {
  * el actuador a tiempo.
  */
 void Cmd_SensorEvent(void) {
-	uint8_t i = 0;
+    uint8_t i = 0;
 
-	// Recorremos TODO el payload de a pares [outNum, irState]
-	while (i + 1 < Rx.payloadLen) {
-		uint8_t outNum   = Rx.payload[i];
-		uint8_t irState  = Rx.payload[i + 1];
-		i += 2; // Saltamos al siguiente par
+    // Recorremos TODO el payload de a pares [outNum, irState]
+    while (i + 1 < Rx.payloadLen) {
+        uint8_t outNum  = Rx.payload[i];
+        uint8_t irState = Rx.payload[i + 1];
+        i += 2; // Saltamos al siguiente par
 
-		if (irState == 1) { // Solo nos interesa cuando la caja ENTRA
-			switch(outNum) {
-				case 0: Ev.ir0_active = 1; break;
-				case 1: Ev.ir1_active = 1; break;
-				case 2: Ev.ir2_active = 1; break;
-			}
-		}
-	}
+        if (irState == 1) { // Solo nos interesa cuando la caja ENTRA
+            switch(outNum) {
+                case 0: Ev.ir0_active = 1; break;
+                case 1: Ev.ir1_active = 1; break;
+                case 2: Ev.ir2_active = 1; break;
+            }
+        }
+    }
 }
 
 /*
@@ -661,19 +609,55 @@ void Cmd_SensorEvent(void) {
  * cuando llegue al sensor correspondiente.
  */
 void Cmd_NuevaCaja(void) {
-	// 1. Guardamos el tipo de caja en la variable de resguardo
-	// Rx.payload[0] tiene el 6, 8 o 10
-	lastboxtype = Rx.payload[0];
+    // 1. Guardamos el tipo de caja en la variable de resguardo
+    // Rx.payload[0] tiene el 6, 8 o 10
+    lastboxtype = Rx.payload[0];
 
-	// 2. Levantamos el flag para que el while(1) sepa que hay una caja nueva
-	Ev.box_entry_active = 1;
+    // 2. Levantamos el flag para que el while(1) sepa que hay una caja nueva
+    Ev.box_entry_active = 1;
+}
+
+/* ============================================================
+ * DESPACHO DE RESPUESTAS TX DIFERIDAS
+ * -----------------------------------------------------------------------------
+ * Se llama desde el loop principal DESPUÉS de Protocol_HandleUART.
+ * Garantiza que cualquier SendSimuCMD se ejecute cuando la máquina
+ * de estados del protocolo ya terminó de procesar la trama entrante,
+ * evitando que la respuesta inmediata del simulador Qt corrompa el
+ * estado del parser RX.
+ * ============================================================ */
+void HandlePendingReplies(void) {
+    if (Ev.reply_error) {
+        Ev.reply_error = 0;
+        sys_state = ST_ERROR;
+        /* Opcional: enviar trama de error al simulador si el protocolo lo define */
+    }
+
+    if (Ev.reply_send_start) {
+        Ev.reply_send_start = 0;
+        SendSimuCMD(0x50, NULL, 0);
+    }
+
+    if (Ev.reply_send_stop) {
+        Ev.reply_send_stop = 0;
+        SendSimuCMD(0x51, NULL, 0);
+    }
+
+    if (Ev.reply_send_reset) {
+        Ev.reply_send_reset = 0;
+        SendSimuCMD(0x53, NULL, 0);
+    }
 }
 
 /* ============================================================
  * TABLA DE COMANDOS
+ * -----------------------------------------------------------------------------
+ * Relaciona cada CMD con su función callback.
+ * El decodificador Protocol_DecodeCMD (Protocol_UNER.c) itera esta tabla
+ * para despachar el handler correcto al recibir una trama válida.
  * ============================================================ */
 const _sCommand command_table[] = {
-    { 0xF0, Cmd_AckAlive      },   /* ACK conexión del simulador            */ 
+    { 0xF0, Cmd_AckAlive      },   /* ACK conexión del simulador            */
     { 0x50, Cmd_ConfigCinta   },   /* ACK inicio + configuración de salidas */
     { 0x51, Cmd_AckStop       },   /* ACK detención                         */
     { 0x52, Cmd_AckActuador   },   /* ACK activación de actuador            */
@@ -686,202 +670,115 @@ const _sCommand command_table[] = {
 
 /* ============================================================
  * DECODIFICADOR DE COMANDOS
+ * -----------------------------------------------------------------------------
+ * Recibe el CMD ya validado (checksum OK) desde Protocol_HandleUART
+ * y busca en command_table el handler correspondiente.
+ *
+ * Protocol_DecodeCMD se llama desde Protocol_UNER.c en el estado GET_CKS.
+ * Su prototipo está declarado en Protocol_UNER.h; la implementación
+ * vive aquí para que tenga acceso directo a la tabla de la aplicación.
+ *
+ * Para agregar un nuevo comando:
+ *   1. Escribir la función callback  void Cmd_NuevoNombre(void) { ... }
+ *   2. Añadir una entrada { 0xXX, Cmd_NuevoNombre } en command_table.
+ *   No se necesita tocar ni Protocol_UNER.c ni Protocol_UNER.h.
  * ============================================================ */
-void DecodeCMD(uint8_t cmd) {
+void Protocol_DecodeCMD(uint8_t cmd,
+                        const protocol_command_t *table,
+                        uint8_t table_size)
+{
+    /*
+     * Parámetros table / table_size son ignorados aquí: la tabla canónica
+     * de esta aplicación es command_table (definida arriba).
+     * Si se quisiera reutilizar la librería con múltiples tablas, bastaría
+     * con pasar la tabla correcta desde Protocol_HandleUART y eliminar la
+     * referencia directa a command_table.
+     */
+    (void)table;
+    (void)table_size;
+
     for (uint8_t i = 0; i < MAX_COMMANDS; i++) {
         if (command_table[i].cmd_id == cmd) {
             if (command_table[i].execute) command_table[i].execute();
             return;
         }
     }
-    /* Comando desconocido — enviar respuesta de error en texto */
+    /* Comando desconocido — aviso por debug */
     TxSendString("UNER:Cmd_Unknown\n");
 }
 
 /* ============================================================
- *							HARDWARE
+ *                        HARDWARE
  * ============================================================ */
 
-void DoStartBotton(){
-	SendSimuCMD(0xF0, NULL, 0); // CMD 0xF0, sin puntero de datos, longitud
+void DoStartBotton() {
+    SendSimuCMD(0xF0, NULL, 0); // CMD 0xF0, sin puntero de datos, longitud
 }
 
-void DoStopBotton(){
-	// Condición: Solo actuar si el sistema NO está en IDLE (está conectado)
-	// También ignoramos si ya hubo un error crítico (ST_ERROR)
-	if (sys_state == ST_RUNNING || sys_state == ST_READY) {
-		
-		// 1. Mandar comando de parada según protocolo (0x51)
-		SendSimuCMD(0x51, NULL, 0);
+void DoStopBotton() {
+    // Condición: Solo actuar si el sistema NO está en IDLE (está conectado)
+    // También ignoramos si ya hubo un error crítico (ST_ERROR)
+    if (sys_state == ST_RUNNING || sys_state == ST_READY) {
 
-		// 2. Seguridad: Forzar retracción física de todos los brazos (0x52)
-		// Esto evita que queden a mitad de camino si el simulador se pausa
-		uint8_t pl[2] = {0x07, 0x00}; // Mask 0x07 (brazos 0,1,2), Pos 0x00 (retraer)
-		SendSimuCMD(0x52, pl, 2);
+        // 1. Mandar comando de parada según protocolo (0x51)
+        SendSimuCMD(0x51, NULL, 0);
 
-		// 3. Actualizar estado local a READY (esperando START)
-		sys_state = ST_READY;
+        // 2. Seguridad: Forzar retracción física de todos los brazos (0x52)
+        // Esto evita que queden a mitad de camino si el simulador se pausa
+        uint8_t pl[2] = {0x07, 0x00}; // Mask 0x07 (brazos 0,1,2), Pos 0x00 (retraer)
+        SendSimuCMD(0x52, pl, 2);
 
-		TxSendString("\r\n[!] STOP: Cinta detenida.\r\n");
-	}
-	else {
-		// Si estamos en ST_IDLE o ST_ERROR, no hacemos nada
-		TxSendString("\r\n[?] STOP ignorado: No hay conexion activa.\r\n");
-	}
-}
-void DoResetBotton(){
-	// 1. Mandar comando de Reset físico al simulador (CMD 0x53)
-	SendSimuCMD(0x53, NULL, 0);
+        // 3. Actualizar estado local a READY (esperando START)
+        sys_state = ST_READY;
 
-	// 2. Borrar el contenido de las colas (Arreglos)
-	// Usamos memset para llenar de ceros toda la memoria de los arreglos
-	memset(Queue0, 0, sizeof(Queue0));
-	memset(Queue1, 0, sizeof(Queue1));
-	memset(Queue2, 0, sizeof(Queue2));
-
-	// 3. Resetear contadores de elementos de cada tramo
-	Qelements0 = 0;
-	Qelements1 = 0;
-	Qelements2 = 0;
-
-	// 4. Resetear variables de traspaso de cajas entre zonas
-	lastboxtype = 0;
-	last_box_Q1 = 0;
-	last_box_Q2 = 0;
-
-	// 5. Resetear todas las banderas de eventos de la FSM
-	Ev.box_entry_active = 0;
-	Ev.ir0_active       = 0;
-	Ev.ir1_active       = 0;
-	Ev.ir2_active       = 0;
-	Ev.movQ0            = 0;
-	Ev.movQ1            = 0;
-	Ev.movQ2            = 0;
-	Ev.box_entry_Q1     = 0;
-	Ev.box_entry_Q2     = 0;
-
-	// 6. Resetear actuadores a estado de reposo
-	for (uint8_t i = 0; i < 3; i++){
-		Actuator[i].state        = ACT_IDLE;
-		Actuator[i].timestamp_ms = 0;
-	}
-
-	// 7. Volver al estado de espera inicial
-	sys_state = ST_IDLE;
-
-
-	TxSendString("\r\n[!] RESET INTEGRAL: Software y Hardware limpios.\r\n");
-}
-
-
-
-/* ============================================================
- * INTERRUPCIONES
- * ============================================================ */
-
-/* RX UART — guarda byte en ring buffer de recepción */
-ISR(USART_RX_vect) {
-    uint8_t data    = UDR0;
-    uint8_t next_iw = (Rx.rBuf.iw + 1) & MASK;
-    if (next_iw != Rx.rBuf.ir) {
-        Rx.rBuf.buf[Rx.rBuf.iw] = data;
-        Rx.rBuf.iw               = next_iw;
-    }
-}
-
-/* UDRE — vacía el ring buffer de TX byte a byte */
-ISR(USART_UDRE_vect) {
-    if (Tx.rBuf.ir != Tx.rBuf.iw) {
-        UDR0        = Tx.rBuf.buf[Tx.rBuf.ir];
-        Tx.rBuf.ir  = (Tx.rBuf.ir + 1) & MASK;
+        TxSendString("\r\n[!] STOP: Cinta detenida.\r\n");
     } else {
-        UCSR0B &= ~(1 << UDRIE0);   /* Buffer vacío ? deshabilitar interrupción */
+        // Si estamos en ST_IDLE o ST_ERROR, no hacemos nada
+        TxSendString("\r\n[?] STOP ignorado: No hay conexion activa.\r\n");
     }
 }
 
-/*
- * Timer0 CTC — Base de tiempo del sistema.
- * Se dispara cada 2 ms (F_CPU=16MHz, prescaler=256, OCR0A=124).
- * Incrementa tick_ms que usan los módulos de actuadores y debug.
- */
-ISR(TIMER0_COMPA_vect) {
-    tick_ms += 2;
-	
-	Debounce(&StartBotton, &PINC, (1 << PC2));
-	Debounce(&StopBotton, &PINC, (1 << PC3));
-	Debounce(&ResetBotton,&PINC, (1<<PC4));
-}
+void DoResetBotton() {
+    // 1. Mandar comando de Reset físico al simulador (CMD 0x53)
+    SendSimuCMD(0x53, NULL, 0);
 
-/*
- * Timer1 OVF — Heartbeat LED en PB5.
- * Prescaler=8 ? OVF cada ~32 ms. 30 OVFs ? 960 ms ? 1 Hz.
- */
-ISR(TIMER1_OVF_vect) {
-    ovf_counter_hb++;
-    if (ovf_counter_hb >= 30) {
-        PORTB       ^= (1 << PB5);   /* Toggle LED heartbeat */
-        ovf_counter_hb = 0;
+    // 2. Borrar el contenido de las colas (Arreglos)
+    // Usamos memset para llenar de ceros toda la memoria de los arreglos
+    memset(Queue0, 0, sizeof(Queue0));
+    memset(Queue1, 0, sizeof(Queue1));
+    memset(Queue2, 0, sizeof(Queue2));
+
+    // 3. Resetear contadores de elementos de cada tramo
+    Qelements0 = 0;
+    Qelements1 = 0;
+    Qelements2 = 0;
+
+    // 4. Resetear variables de traspaso de cajas entre zonas
+    lastboxtype = 0;
+    last_box_Q1 = 0;
+    last_box_Q2 = 0;
+
+    // 5. Resetear todas las banderas de eventos de la FSM
+    Ev.box_entry_active = 0;
+    Ev.ir0_active       = 0;
+    Ev.ir1_active       = 0;
+    Ev.ir2_active       = 0;
+    Ev.movQ0            = 0;
+    Ev.movQ1            = 0;
+    Ev.movQ2            = 0;
+    Ev.box_entry_Q1     = 0;
+    Ev.box_entry_Q2     = 0;
+
+    // 6. Resetear actuadores a estado de reposo
+    for (uint8_t i = 0; i < 3; i++) {
+        Actuator[i].state        = ACT_IDLE;
+        Actuator[i].timestamp_ms = 0;
     }
-}
 
-/* ============================================================
- * PROTOCOLO RX — MÁQUINA DE ESTADOS
- * ============================================================ */
-void HandleUART(void) {
-	// Procesamos TODO el buffer de una, no de a un byte
-	while (Rx.rBuf.ir != Rx.rBuf.iw){
-		uint8_t b  = Rx.rBuf.buf[Rx.rBuf.ir];
-		Rx.rBuf.ir = (Rx.rBuf.ir + 1) & MASK;
-		
-		switch (Rx.hdrst) {
-			case WAIT_U:
-				if (b == 'U') { Rx.cks = b; Rx.hdrst = WAIT_N; }
-			break;
-			case WAIT_N:
-				if (b == 'N') { Rx.cks ^= b; Rx.hdrst = WAIT_E; }
-						else           { Rx.hdrst = WAIT_U; }
-			break;
-			case WAIT_E:
-				if (b == 'E') { Rx.cks ^= b; Rx.hdrst = WAIT_R; }
-						else           { Rx.hdrst = WAIT_U; }
-			break;
-			case WAIT_R:
-				if (b == 'R') { Rx.cks ^= b; Rx.hdrst = GET_LEN; }
-				else           { Rx.hdrst = WAIT_U; }
-			break;
-			case GET_LEN:
-				Rx.nBytes  = b;
-				Rx.cks    ^= b;
-				Rx.hdrst   = WAIT_DP;
-			break;
-			case WAIT_DP:
-				if (b == ':') { Rx.cks ^= b; Rx.hdrst = GET_CMD; }
-				else           { Rx.hdrst = WAIT_U; }
-			break;
-			case GET_CMD:
-				Rx.current_cmd = b;
-				Rx.cks ^= b;
-				Rx.payloadLen = (Rx.nBytes >= 2) ? (Rx.nBytes - 2) : 0;
-				Rx.payload_idx = 0;
-				Rx.hdrst = (Rx.payloadLen > 0) ? GET_PAYLOAD : GET_CKS;
-			break;
-			case GET_PAYLOAD:
-				if (Rx.payload_idx < MAX_PAYLOAD) {
-					Rx.payload[Rx.payload_idx] = b;
-				}
-				Rx.payload_idx++;
-				Rx.cks ^= b;
-				if (Rx.payload_idx >= Rx.payloadLen) Rx.hdrst = GET_CKS;
-			break;
-			case GET_CKS:
-				if (b == Rx.cks) {
-					DecodeCMD(Rx.current_cmd);
-				}
-				/* Si el checksum falla, la trama se descarta silenciosamente */
-				Rx.hdrst = WAIT_U;
-			break;
-		}
-	}
+    // 7. Volver al estado de espera inicial
+    sys_state = ST_IDLE;
+
+    TxSendString("\r\n[!] RESET INTEGRAL: Software y Hardware limpios.\r\n");
 }
 
 /* ============================================================
@@ -890,56 +787,60 @@ void HandleUART(void) {
  *   PA1 — Actividad de actuadores (manejado en FireActuator/HandleActuators)
  * ============================================================ */
 void UpdateDebugLEDs(void) {
-	switch (sys_state) {
-		case ST_IDLE:
-			// Un parpadeo muy tenue (cada 2 segundos) para saber que el micro vive
-			if ((tick_ms % 2000) < 100) PORTC |= (1 << PC0);
-			else PORTC &= ~(1 << PC0);
-		break;	
-		case ST_READY:
-			PORTC |= (1 << PC0); // Fijo cuando hay conexión
-		break;
-		case ST_RUNNING:
-			if ((tick_ms - debug_led_ts) >= DEBUG_FAST_MS) {
-				PORTC ^= (1 << PC0); // Toggle rápido clasificando
-				debug_led_ts = tick_ms;
-			}
-		break;
-	}
+    switch (sys_state) {
+        case ST_IDLE:
+            // Un parpadeo muy tenue (cada 2 segundos) para saber que el micro vive
+            if ((tick_ms % 2000) < 100) PORTC |= (1 << PC0);
+            else PORTC &= ~(1 << PC0);
+            break;
+        case ST_READY:
+            PORTC |= (1 << PC0); // Fijo cuando hay conexión
+            break;
+        case ST_RUNNING:
+            if ((tick_ms - debug_led_ts) >= DEBUG_FAST_MS) {
+                PORTC ^= (1 << PC0); // Toggle rápido clasificando
+                debug_led_ts = tick_ms;
+            }
+            break;
+        case ST_ERROR:
+            break;
+    }
 }
+
 /* ============================================================
  * DEBUG UART EN PUERTO A
  *   PA0 — Estado del sistema
  *   PA1 — Actividad de actuadores (manejado en FireActuator/HandleActuators)
  * ============================================================ */
 void DebugQueues(void) {
-	
-	TxSendString("\r\n--- ESTADO DE CINTA ---\r\n");
-	
-	// Formateamos Queue 0
-	TxSendString("Q0: [");
-	for(uint8_t i=0; i<MaxQueue; i++) {
-		TxAddChar(Queue0[i] == 0 ? '-' : (Queue0[i] == 10 ? 'X' : Queue0[i] + '0'));
-		TxAddChar(' ');
-	}
-	TxSendString("]\r\n");
 
-	// Formateamos Queue 1
-	TxSendString("Q1: [");
-	for(uint8_t i=0; i<MaxQueue; i++) {
-		TxAddChar(Queue1[i] == 0 ? '-' : (Queue1[i] == 10 ? 'X' : Queue1[i] + '0'));
-		TxAddChar(' ');
-	}
-	TxSendString("]\r\n");
+    TxSendString("\r\n--- ESTADO DE CINTA ---\r\n");
 
-	// Formateamos Queue 2
-	TxSendString("Q2: [");
-	for(uint8_t i=0; i<MaxQueue; i++){
-		TxAddChar(Queue2[i] == 0 ? '-' : (Queue2[i] == 10 ? 'X' : Queue2[i] + '0'));
-		TxAddChar(' ');
-	}
-	TxSendString("]\r\n-----------------------\r\n");
+    // Formateamos Queue 0
+    TxSendString("Q0: [");
+    for (uint8_t i = 0; i < MaxQueue; i++) {
+        TxAddChar(Queue0[i] == 0 ? '-' : (Queue0[i] == 10 ? 'X' : Queue0[i] + '0'));
+        TxAddChar(' ');
+    }
+    TxSendString("]\r\n");
+
+    // Formateamos Queue 1
+    TxSendString("Q1: [");
+    for (uint8_t i = 0; i < MaxQueue; i++) {
+        TxAddChar(Queue1[i] == 0 ? '-' : (Queue1[i] == 10 ? 'X' : Queue1[i] + '0'));
+        TxAddChar(' ');
+    }
+    TxSendString("]\r\n");
+
+    // Formateamos Queue 2
+    TxSendString("Q2: [");
+    for (uint8_t i = 0; i < MaxQueue; i++) {
+        TxAddChar(Queue2[i] == 0 ? '-' : (Queue2[i] == 10 ? 'X' : Queue2[i] + '0'));
+        TxAddChar(' ');
+    }
+    TxSendString("]\r\n-----------------------\r\n");
 }
+
 /* ============================================================
  * INICIALIZACIONES
  * ============================================================ */
@@ -952,19 +853,19 @@ void InitUART0(void) {
 }
 
 void InitPort(void) {
-	/* PB5 — Heartbeat LED (Salida) */
-	DDRB |= (1 << PB5);
+    /* PB5 — Heartbeat LED (Salida) */
+    DDRB |= (1 << PB5);
 
-	/* PC0 y PC1 como salidas (LEDs de estado y actuadores) */
-	DDRC |= (1 << PC0) | (1 << PC1);
-	PORTC &= ~((1 << PC0) | (1 << PC1));
+    /* PC0 y PC1 como salidas (LEDs de estado y actuadores) */
+    DDRC |= (1 << PC0) | (1 << PC1);
+    PORTC &= ~((1 << PC0) | (1 << PC1));
 
-	/* --- CONFIGURACIÓN BOTONES / ENTRADAS --- */
-	/* 1. Configurar PC2, PC3 y PC4 como entradas (DDR = 0) */
-	DDRC &= ~((1 << PC2) | (1 << PC3) | (1 << PC4));
-	
-	/* 2. Activar Pull-ups internas (PORT = 1 mientras DDR = 0) */
-	PORTC |= (1 << PC2) | (1 << PC3) | (1 << PC4);
+    /* --- CONFIGURACIÓN BOTONES / ENTRADAS --- */
+    /* 1. Configurar PC2, PC3 y PC4 como entradas (DDR = 0) */
+    DDRC &= ~((1 << PC2) | (1 << PC3) | (1 << PC4));
+
+    /* 2. Activar Pull-ups internas (PORT = 1 mientras DDR = 0) */
+    PORTC |= (1 << PC2) | (1 << PC3) | (1 << PC4);
 }
 
 /*
@@ -999,6 +900,41 @@ void TogglePin(volatile uint8_t *port, uint8_t pin) {
 }
 
 /* ============================================================
+ * INTERRUPCIONES
+ * ============================================================ */
+
+/*
+ * NOTA: ISR(USART_RX_vect) e ISR(USART_UDRE_vect) están definidas
+ * en Protocol_UNER.c junto con los ring buffers que manejan.
+ * Definirlas aquí causaría "duplicate ISR" en tiempo de enlace.
+ */
+
+/*
+ * Timer0 CTC — Base de tiempo del sistema.
+ * Se dispara cada 2 ms (F_CPU=16MHz, prescaler=256, OCR0A=124).
+ * Incrementa tick_ms que usan los módulos de actuadores y debug.
+ */
+ISR(TIMER0_COMPA_vect) {
+    tick_ms += 2;
+
+    Debounce(&StartBotton, &PINC, (1 << PC2));
+    Debounce(&StopBotton,  &PINC, (1 << PC3));
+    Debounce(&ResetBotton, &PINC, (1 << PC4));
+}
+
+/*
+ * Timer1 OVF — Heartbeat LED en PB5.
+ * Prescaler=8 ? OVF cada ~32 ms. 30 OVFs ? 960 ms ? 1 Hz.
+ */
+ISR(TIMER1_OVF_vect) {
+    ovf_counter_hb++;
+    if (ovf_counter_hb >= 30) {
+        PORTB       ^= (1 << PB5);   /* Toggle LED heartbeat */
+        ovf_counter_hb = 0;
+    }
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 int main(void) {
@@ -1010,21 +946,26 @@ int main(void) {
     InitTimer0();
     InitTimer1();
 
-    /* Inicializar estructuras RX/TX */
-	
-    Rx.rBuf.iw   = 0;
-    Rx.rBuf.ir   = 0;
-    Rx.hdrst     = WAIT_U;
-    Tx.rBuf.iw   = 0;
-    Tx.rBuf.ir   = 0;
-    Tx.pMsg      = NULL;
+    /*
+     * Inicializar la librería de protocolo.
+     * Protocol_Init pone a cero los índices de los ring buffers
+     * de Rx y Tx, y resetea la máquina de estados a WAIT_U.
+     */
+    Protocol_Init();
 
     /* Inicializar cola de cajas */
-	Ev.movQ0 = 0;
-	Ev.movQ1 = 0;
-	Ev.movQ2 = 0; 
+    Ev.movQ0 = 0;
+    Ev.movQ1 = 0;
+    Ev.movQ2 = 0;
+
+    /* Inicializar flags de respuesta TX diferida */
+    Ev.reply_send_start = 0;
+    Ev.reply_send_stop  = 0;
+    Ev.reply_send_reset = 0;
+    Ev.reply_error      = 0;
+
     /* Inicializar actuadores */
-    for (uint8_t i = 0; i < 3; i++){
+    for (uint8_t i = 0; i < 3; i++) {
         Actuator[i].state        = ACT_IDLE;
         Actuator[i].timestamp_ms = 0;
     }
@@ -1033,23 +974,23 @@ int main(void) {
     config_salidas[0] = 0;
     config_salidas[1] = 0;
     config_salidas[2] = 0;
-	
-    sei();
-	
-	SendSimuCMD(0xF0, NULL, 0); // mandamos al comienzo de cada reset el estado IDLE 
-	
-    /* ============================================================
-     * LOOP PRINCIPAL — Completamente no bloqueante (mas o menos) 
-     * ============================================================ */
 
-	while (1) {
-	   
-		// --- TASKS ---
-	   
-		HandleUART();
-		HandleTX();
-		HandleActuators();
-		HandleQueue();
-		UpdateDebugLEDs();
-	}
+    sei();
+
+    SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
+
+    /* ============================================================
+     * LOOP PRINCIPAL — Completamente no bloqueante (mas o menos)
+     * ============================================================ */
+    while (1) {
+
+        // --- TASKS ---
+
+        Protocol_HandleUART();     /* Procesa bytes del buffer RX y llama a Protocol_DecodeCMD */
+        HandlePendingReplies();    /* Despacha respuestas TX diferidas por los callbacks RX      */
+        HandleTX();                /* Stub — el vaciado real lo hace la ISR USART_UDRE_vect      */
+        HandleActuators();
+        HandleQueue();
+        UpdateDebugLEDs();
+    }
 }
