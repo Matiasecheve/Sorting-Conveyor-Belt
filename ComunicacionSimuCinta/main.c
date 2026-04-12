@@ -1075,9 +1075,10 @@ int main(void) {
 	/* Inicializar la entrada del trigger en bajo */
 	PORTD &= ~(1 << PD7);
 	
-	config_salidas[0] = 6;  // El brazo 0 patea las cajas de 6cm
-	config_salidas[1] = 8;  // El brazo 1 patea las cajas de 8cm
+	config_salidas[0] = 8;  // El brazo 0 patea las cajas de 6cm
+	config_salidas[1] = 6;  // El brazo 1 patea las cajas de 8cm
 	config_salidas[2] = 10; // El brazo 2 patea las cajas de 10cm
+	
     sei();
 	
     SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
@@ -1101,7 +1102,7 @@ void HCRS04() {
 	
 	/* --- TIMEOUT DE SEGURIDAD --- */
 	// Si el sensor lleva más de 100ms ocupado (no hay eco), lo reseteamos.
-	if ((SensorCajas.state != HCSR_IDLE) && ((tick_ms - last_sensor_trigger) > 100)) {
+	if ((SensorCajas.state != HCSR_IDLE) && ((tick_ms - last_sensor_trigger) > 100)){
 		SensorCajas.state = HCSR_IDLE;
 	}
 
@@ -1124,20 +1125,21 @@ void HCRS04() {
 		/* Clasificación y Debug UART */
 		// Si detecta un objeto en el rango válido, levanta el evento.
 		if (cm > 2 && cm <= 6) {
-			TxSendString("\r\n>> Micro dice: 6cm\r\n");
 			lastboxtype = 6;
 			Ev.box_entry_active = 1;
 		}
 		else if (cm > 6 && cm <= 8) {
-			TxSendString("\r\n>> Micro dice: 8cm\r\n");
 			lastboxtype = 8;
 			Ev.box_entry_active = 1;
 		}
 		else if (cm > 8 && cm <= 10) {
-			TxSendString("\r\n>> Micro dice: 10cm\r\n");
 			lastboxtype = 10;
 			Ev.box_entry_active = 1;
-		}
+		}/*else if(cm>11 || cm<5){
+			TxSendString("\r\n>> Micro dice: 10cm\r\n");
+			lastboxtype = 1;
+			Ev.box_entry_active = 1;
+		}*/
 
 		/* ---> INICIA EL SIMULADOR DE CINTA <--- */
 		if (cm > 2 && cm <= 10) {
@@ -1145,8 +1147,8 @@ void HCRS04() {
 			sim_timer = tick_ms;   // Inicia el cronómetro
 		}
 
-/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
-SensorCajas.state = HCSR_IDLE;
+		/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
+		SensorCajas.state = HCSR_IDLE;
 	}
 }
 
@@ -1180,7 +1182,6 @@ void Simulador_Cinta(void) {
 			
 			// Activar la flag correspondiente
 			Ev.ir0_active = 1;
-			TxSendString("\r\n[SIM] IR0 Inyectado y Flag Activa\r\n");
 		}
 		
 		// 2. Revisar si hay cajas en la Zona 1 (lista no vacía)
@@ -1190,7 +1191,6 @@ void Simulador_Cinta(void) {
 			
 			// Activar la flag correspondiente
 			Ev.ir1_active = 1;
-			TxSendString("\r\n[SIM] IR1 Inyectado y Flag Activa\r\n");
 		}
 		
 		// 3. Revisar si hay cajas en la Zona 2 (lista no vacía)
@@ -1200,7 +1200,6 @@ void Simulador_Cinta(void) {
 			
 			// Activar la flag correspondiente
 			Ev.ir2_active = 1;
-			TxSendString("\r\n[SIM] IR2 Inyectado y Flag Activa\r\n");
 		}
 
 		// Reiniciar el cronómetro
