@@ -1,3 +1,4 @@
+
 /*
  * =============================================================================
  * SISTEMA DE CLASIFICACIÓN AUTOMATIZADA DE CAJAS - ACTIVIDAD Nº3
@@ -74,6 +75,7 @@
 #include "dBounce.h"
 #include "SG90.h"
 #include "HCSR04.h"
+#include "TCRT5000.h"
 
 /* ============================================================
  * CONSTANTES GLOBALES
@@ -159,6 +161,10 @@ typedef struct {
     volatile uint8_t reply_send_stop;    /* 0x51 ? confirmar detención       */
     volatile uint8_t reply_send_reset;   /* 0x53 ? confirmar reset           */
     volatile uint8_t reply_error;        /* transitar a ST_ERROR             */
+	
+	/* Modo de simulacion*/
+	volatile uint8_t hw_sensors_enabled;
+	
 } _sEventFlags;
 
 /* ============================================================
@@ -205,9 +211,21 @@ volatile uint32_t sim_timer = 0;
 void TogglePin(volatile uint8_t *port, uint8_t pin);
 
 /* Hardware */
+void HCRS04();
+void HandlePhysicalIRs(void);
+
+/* Declaracion de actuadores y sensores */
+SG90_t Servo[3];
+
+TCRT5000_t IrEntry = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC0 }; // Sensor debajo del HCSR04
+TCRT5000_t IrQ0    = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC1 }; // Sensor Zona 0
+TCRT5000_t IrQ1    = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC2 }; // Sensor Zona 1
+TCRT5000_t IrQ2    = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC3 };
+
 void DoStartBotton();
 void DoStopBotton();
 void DoResetBotton();
+
 
 void Sensor_Trig(uint8_t state);
 uint8_t Sensor_Echo(void);
@@ -215,8 +233,6 @@ uint32_t Sensor_GetUs(void);
 
 HCSR04_Config_t SensorCajas;
 uint32_t last_sensor_trigger; 
-
-void HCRS04();
 
 /* ============================================================
  * MACROS DE COMPATIBILIDAD
@@ -297,21 +313,21 @@ SG90_t Servo[3];
 debounce_t StartBotton = {
     .pressed_count = 0,
     .prev_state = 1,
-    .onPress = DoStartBotton,
+    .onPress = NULL,
     .onRelease = NULL
 };
 
 debounce_t StopBotton = {
     .pressed_count = 0,
     .prev_state = 1,
-    .onPress = DoStopBotton,
+    .onPress = NULL,
     .onRelease = NULL
 };
 
 debounce_t ResetBotton = {
     .pressed_count = 0,
     .prev_state = 1,
-    .onPress = DoResetBotton,
+    .onPress = NULL,
     .onRelease = NULL
 };
 
@@ -405,19 +421,19 @@ void HandleQueue() {
     if (Ev.movQ0) {
         static uint8_t i0 = 1;
         Queue0[MaxQueue - i0] = Queue0[MaxQueue - i0 - 1];
-        if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; DebugQueues(); }
+        if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; /*DebugQueues();*/ }
     }
 
     if (Ev.movQ1) {
         static uint8_t i1 = 1;
         Queue1[MaxQueue - i1] = Queue1[MaxQueue - i1 - 1];
-        if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; DebugQueues(); }
+        if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; /*DebugQueues();*/ }
     }
 
     if (Ev.movQ2){ 
         static uint8_t i2 = 1;
         Queue2[MaxQueue - i2] = Queue2[MaxQueue - i2 - 1];
-        if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; DebugQueues(); }
+        if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; /*DebugQueues();*/ }
     }
 
 }
@@ -610,6 +626,9 @@ void Cmd_AckVelocidad(void) {
  * el actuador a tiempo.
  */
 void Cmd_SensorEvent(void) {
+	
+	Ev.hw_sensors_enabled = 0; // Qt mandó un comando, le pasamos el control.
+
     uint8_t i = 0;
 
     // Recorremos TODO el payload de a pares [outNum, irState]
@@ -635,6 +654,9 @@ void Cmd_SensorEvent(void) {
  * cuando llegue al sensor correspondiente.
  */
 void Cmd_NuevaCaja(void) {
+	
+	Ev.hw_sensors_enabled = 0; // Qt mando un comando, le pasamos el control. 
+	
     // 1. Guardamos el tipo de caja en la variable de resguardo
     // Rx.payload[0] tiene el 6, 8 o 10
     lastboxtype = Rx.payload[0];
@@ -846,28 +868,40 @@ uint32_t Sensor_GetUs(void) {
 
 /* ============================================================
  * DEBUG LEDs EN PUERTO A
- *   PA0 — Estado del sistema
- *   PA1 — Actividad de actuadores (manejado en FireActuator/HandleActuators)
+ *   PB5 — Estado del sistema
  * ============================================================ */
 void UpdateDebugLEDs(void) {
-    switch (sys_state) {
-        case ST_IDLE:
-            // Un parpadeo muy tenue (cada 2 segundos) para saber que el micro vive
-            if ((tick_ms % 2000) < 100) PORTC |= (1 << PC0);
-            else PORTC &= ~(1 << PC0);
-            break;
-        case ST_READY:
-            PORTC |= (1 << PC0); // Fijo cuando hay conexión
-            break;
-        case ST_RUNNING:
-            if ((tick_ms - debug_led_ts) >= DEBUG_FAST_MS) {
-                PORTC ^= (1 << PC0); // Toggle rápido clasificando
-                debug_led_ts = tick_ms;
-            }
-            break;
-        case ST_ERROR:
-            break;
-    }
+	switch (sys_state) {
+		case ST_IDLE:
+		// Parpadeo muy tenue (ON durante 100ms cada 2 segundos)
+		if ((tick_ms % 2000) < 100) {
+			PORTB |= (1 << PB5);
+			} else {
+			PORTB &= ~(1 << PB5);
+		}
+		break;
+		
+		case ST_READY:
+		// Fijo ON cuando hay conexión pero la cinta está detenida
+		PORTB |= (1 << PB5);
+		break;
+		
+		case ST_RUNNING:
+		// Parpadeo rápido (toggle cada 100ms) clasificando
+		if ((tick_ms - debug_led_ts) >= DEBUG_FAST_MS) {
+			PORTB ^= (1 << PB5);
+			debug_led_ts = tick_ms;
+		}
+		break;
+		
+		case ST_ERROR:
+		// Parpadeo lento de advertencia (toggle cada 500ms)
+		if ((tick_ms - debug_led_ts) >= 500) {
+			PORTB ^= (1 << PB5);
+			debug_led_ts = tick_ms;
+		}
+		break;
+	}
 }
 
 /* ============================================================
@@ -914,28 +948,23 @@ void InitUART0(void) {
 }
 
 void InitPort(void){
-    /* PB5 — Heartbeat LED (Salida) */
-    DDRB |= (1 << PB5);
+	/* PB5 — Heartbeat LED (Salida) */
+	DDRB |= (1 << PB5);
 	
-    /* PC0 y PC1 como salidas (LEDs de estado y actuadores) */
-    DDRC |= (1 << PC0) | (1 << PC1);
-    PORTC &= ~((1 << PC0) | (1 << PC1));
+	/* --- CONFIGURACIÓN BOTONES (Mudados a PB0, PB1, PB2) --- */
+	DDRB &= ~((1 << PB0) | (1 << PB1) | (1 << PB2));  // Entradas
+	PORTB |= ((1 << PB0) | (1 << PB1) | (1 << PB2));  // Pull-ups activadas
 	
+	/* --- CONFIGURACIÓN DE LOS 4 IR (PC0 a PC3) --- */
+	DDRC &= ~((1 << PC0) | (1 << PC1) | (1 << PC2) | (1 << PC3)); // Entradas
+	PORTC &= ~((1 << PC0) | (1 << PC1) | (1 << PC2) | (1 << PC3)); // SIN Pull-ups (los módulos traen las suyas)
 
-    /* --- CONFIGURACIÓN BOTONES / ENTRADAS --- */
-    /* 1. Configurar PC2, PC3 y PC4 como entradas (DDR = 0) */
-    DDRC &= ~((1 << PC2) | (1 << PC3) | (1 << PC4));
-
-    /* 2. Activar Pull-ups internas (PORT = 1 mientras DDR = 0) */
-    PORTC |= (1 << PC2) | (1 << PC3) | (1 << PC4);
-	
 	/* Configurar los puertos de los servos */
 	DDRD |= (1 << PD2) | (1 << PD3) | (1 << PD4);
 	
 	/* Configurar el HCSR04*/
-DDRD &= ~(1 << PD6); // Echo como ENTRADA
-DDRD |= (1 << PD7);  // Trigger como SALIDA
-	
+	DDRD &= ~(1 << PD6); // Echo como ENTRADA
+	DDRD |= (1 << PD7);  // Trigger como SALIDA
 }
 
 /*
@@ -986,10 +1015,6 @@ void TogglePin(volatile uint8_t *port, uint8_t pin) {
  */
 ISR(TIMER0_COMPA_vect) {
     tick_ms += 2;
-
-    Debounce(&StartBotton, &PINC, (1 << PC2));
-    Debounce(&StopBotton,  &PINC, (1 << PC3));
-    Debounce(&ResetBotton, &PINC, (1 << PC4));
 }
 
 /*
@@ -997,11 +1022,7 @@ ISR(TIMER0_COMPA_vect) {
  * Prescaler=8 ? OVF cada ~32 ms. 30 OVFs ? 960 ms ? 1 Hz.
  */
 ISR(TIMER1_OVF_vect) {
-    ovf_counter_hb++;
-    if (ovf_counter_hb >= 30) {
-        PORTB       ^= (1 << PB5);   /* Toggle LED heartbeat */
-        ovf_counter_hb = 0;
-    }
+
 }
 
 /* ============================================================
@@ -1065,12 +1086,16 @@ int main(void) {
 	SensorCajas.get_us        = Sensor_GetUs;
 	SensorCajas.state         = HCSR_IDLE;
 	
+	/* ============================================================
+     * INICIALIZAR LOS SENSORES IR
+     * ============================================================ */
+    TCRT5000_Init(&IrEntry);
+    TCRT5000_Init(&IrQ0);
+    TCRT5000_Init(&IrQ1);
+    TCRT5000_Init(&IrQ2);
+	
 	/* Inicializar la entrada del trigger en bajo */
 	PORTD &= ~(1 << PD7);
-	
-	config_salidas[0] = 8;  // El brazo 0 patea las cajas de 6cm
-	config_salidas[1] = 6;  // El brazo 1 patea las cajas de 8cm
-	config_salidas[2] = 10; // El brazo 2 patea las cajas de 10cm
 	
     sei();
 	
@@ -1087,62 +1112,74 @@ int main(void) {
         UpdateDebugLEDs();
 		HandleQueue();
 		HCRS04();
-		Simulador_Cinta();
+		HandlePhysicalIRs();
     }
 }
 
 void HCRS04() {
-	
+	static uint8_t last_entry_ir = 1;
+
 	/* --- TIMEOUT DE SEGURIDAD --- */
-	// Si el sensor lleva más de 100ms ocupado (no hay eco), lo reseteamos.
 	if ((SensorCajas.state != HCSR_IDLE) && ((tick_ms - last_sensor_trigger) > 100)){
 		SensorCajas.state = HCSR_IDLE;
 	}
 
-	/* 1. INYECCIÓN DEL ESTÍMULO (Disparo periódico) */
-	// Dispara el sensor incondicionalmente cada 500ms
-	if (((tick_ms - last_sensor_trigger) >= 500) && (SensorCajas.state == HCSR_IDLE)){
+	/* 1. INYECCIÓN DEL ESTÍMULO (Disparo por Evento de Hardware) */
+	uint8_t curr_entry_ir = TCRT5000_ReadDigital(&IrEntry);
+	
+	// Si cortó el láser del PC0 Y el ultrasónico está libre: disparamos.
+	if (Ev.hw_sensors_enabled && (curr_entry_ir == 0) && (last_entry_ir == 1) && (SensorCajas.state == HCSR_IDLE)) {
 		SensorCajas.state = HCSR_TRIG_START;
 		last_sensor_trigger = tick_ms;
 	}
+	last_entry_ir = curr_entry_ir; // Guardamos el estado
 
 	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS */
 	HCSR04_Process(&SensorCajas);
 	
 	/* 3. RECOLECCIÓN DEL RESULTADO */
-	
 	if (SensorCajas.state == HCSR_DATA_READY) {
-		
 		uint16_t cm = SensorCajas.distancia;
 		
-		/* Clasificación y Debug UART */
-		// Si detecta un objeto en el rango válido, levanta el evento.
 		if (cm > 2 && cm <= 6) {
 			lastboxtype = 6;
 			Ev.box_entry_active = 1;
-		}
-		else if (cm > 6 && cm <= 8) {
+			} else if (cm > 6 && cm <= 8) {
 			lastboxtype = 8;
 			Ev.box_entry_active = 1;
-		}
-		else if (cm > 8 && cm <= 10) {
+			} else if (cm > 8 && cm <= 10) {
 			lastboxtype = 10;
 			Ev.box_entry_active = 1;
-		}/*else if(cm>11 || cm<5){
-			TxSendString("\r\n>> Micro dice: 10cm\r\n");
-			lastboxtype = 1;
-			Ev.box_entry_active = 1;
-		}*/
-
-		/* ---> INICIA EL SIMULADOR DE CINTA <--- */
-		if (cm > 2 && cm <= 10) {
-			sim_paso = 1;          // Arranca el paso 1
-			sim_timer = tick_ms;   // Inicia el cronómetro
 		}
-
 		/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
 		SensorCajas.state = HCSR_IDLE;
 	}
+}
+
+void HandlePhysicalIRs(void) {
+	
+	if (Ev.hw_sensors_enabled == 0) return; // Si no se estan recibiendo eventos de hw por Qt
+	
+	// Variables estáticas para recordar el estado anterior (1 = Sin caja, 0 = Detecta caja)
+	static uint8_t last_ir0 = 1, last_ir1 = 1, last_ir2 = 1;
+	
+	uint8_t curr_ir0 = TCRT5000_ReadDigital(&IrQ0);
+	if (curr_ir0 == 0 && last_ir0 == 1) { // Flanco de bajada 
+		Ev.ir0_active = 1;
+	}
+	last_ir0 = curr_ir0;
+	
+	uint8_t curr_ir1 = TCRT5000_ReadDigital(&IrQ1);
+	if (curr_ir1 == 0 && last_ir1 == 1) {
+		Ev.ir1_active = 1;
+	}
+	last_ir1 = curr_ir1;
+	
+	uint8_t curr_ir2 = TCRT5000_ReadDigital(&IrQ2);
+	if (curr_ir2 == 0 && last_ir2 == 1) {
+		Ev.ir2_active = 1;
+	}
+	last_ir2 = curr_ir2;
 }
 
 
@@ -1158,11 +1195,12 @@ void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
 			Rx.rBuf.iw = next_iw;
 		}
 	}
+	
 	/* BORRAMOS LA LLAMADA RECURSIVA QUE ESTABA ACÁ */
 	UCSR0B = ucsrb_respaldo;
 }
 
-void Simulador_Cinta(void) {
+/*void Simulador_Cinta(void) {
 	static uint32_t last_sim_timer = 0;
 	
 	// Ejecutar cada 1.5 segundos (1500 ms)
@@ -1171,31 +1209,23 @@ void Simulador_Cinta(void) {
 		// 1. Revisar si hay cajas en la Zona 0 (lista no vacía)
 		if (Qelements0 > 0) {
 			uint8_t cmd_ir0[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x00, 0x01, 0x6A};
-			Inject_RX_Command(cmd_ir0, sizeof(cmd_ir0));
-			
-			// Activar la flag correspondiente
-			Ev.ir0_active = 1;
+			//Inject_RX_Command(cmd_ir0, sizeof(cmd_ir0));
 		}
 		
 		// 2. Revisar si hay cajas en la Zona 1 (lista no vacía)
 		if (Qelements1 > 0) {
 			uint8_t cmd_ir1[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x01, 0x01, 0x6B};
-			Inject_RX_Command(cmd_ir1, sizeof(cmd_ir1));
-			
-			// Activar la flag correspondiente
-			Ev.ir1_active = 1;
+			//Inject_RX_Command(cmd_ir1, sizeof(cmd_ir1));
+
 		}
 		
 		// 3. Revisar si hay cajas en la Zona 2 (lista no vacía)
 		if (Qelements2 > 0) {
 			uint8_t cmd_ir2[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x02, 0x01, 0x68};
-			Inject_RX_Command(cmd_ir2, sizeof(cmd_ir2));
-			
-			// Activar la flag correspondiente
-			Ev.ir2_active = 1;
-		}
+			//Inject_RX_Command(cmd_ir2, sizeof(cmd_ir2));
 
+		}
 		// Reiniciar el cronómetro
 		last_sim_timer = tick_ms;
 	}
-}
+}*/
