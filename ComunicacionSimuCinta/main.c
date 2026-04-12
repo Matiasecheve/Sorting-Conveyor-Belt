@@ -225,6 +225,21 @@ void HCRS04();
  * directamente. Estos macros redirigen de forma transparente a la librería
  * sin tener que renombrar cada llamada en todo el archivo.
  * ============================================================ */
+
+/* ============================================================
+ * IMPLEMENTACIÓN — TX
+ * -----------------------------------------------------------------------------
+ * Las funciones TxAddChar, TxSendString y SendSimuCMD han sido
+ * reemplazadas por los macros de compatibilidad definidos arriba,
+ * que delegan directamente en Protocol_TxAddChar,
+ * Protocol_TxSendString y Protocol_SendSimuCMD respectivamente.
+ *
+ * HandleTX: en la versión original gestionaba el envío char a char
+ * del pMsg pendiente. La librería gestiona el vaciado del ring buffer
+ * íntegramente mediante la ISR USART_UDRE_vect, por lo que HandleTX
+ * queda como stub vacío para no romper la llamada en el loop principal.
+ * ============================================================ */
+
 #define TxAddChar(d)            Protocol_TxAddChar(d)
 #define TxSendString(s)         Protocol_TxSendString(s)
 #define SendSimuCMD(cmd, pl, l) Protocol_SendSimuCMD(cmd, pl, l)
@@ -404,29 +419,7 @@ void HandleQueue() {
         Queue2[MaxQueue - i2] = Queue2[MaxQueue - i2 - 1];
         if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; DebugQueues(); }
     }
-	
-	
-	
-	
-	
-}
 
-/* ============================================================
- * IMPLEMENTACIÓN — TX
- * -----------------------------------------------------------------------------
- * Las funciones TxAddChar, TxSendString y SendSimuCMD han sido
- * reemplazadas por los macros de compatibilidad definidos arriba,
- * que delegan directamente en Protocol_TxAddChar,
- * Protocol_TxSendString y Protocol_SendSimuCMD respectivamente.
- *
- * HandleTX: en la versión original gestionaba el envío char a char
- * del pMsg pendiente. La librería gestiona el vaciado del ring buffer
- * íntegramente mediante la ISR USART_UDRE_vect, por lo que HandleTX
- * queda como stub vacío para no romper la llamada en el loop principal.
- * ============================================================ */
-void HandleTX(void) {
-    /* El ring buffer de TX lo vacía la ISR USART_UDRE_vect.
-     * No se requiere acción adicional en el loop principal. */
 }
 
 /* ============================================================
@@ -906,8 +899,8 @@ void DebugQueues(void) {
 	for (uint8_t i = 0; i < MaxQueue; i++) {
 		TxAddChar(Queue2[i] == 0 ? '-' : (Queue2[i] == 10 ? 'X' : Queue2[i] + '0'));
 		TxAddChar(' ');
+	
 	}
-	TxSendString("]\r\n-----------------------\r\n");
 }
 /* ============================================================
  * INICIALIZACIONES
@@ -1048,9 +1041,9 @@ int main(void) {
     }
 
     /* Inicializar configuración de salidas a 0 */
-    config_salidas[0] = 0;
+    /*config_salidas[0] = 0;
     config_salidas[1] = 0;
-    config_salidas[2] = 0;
+    config_salidas[2] = 0;*/
 	
 	/* ============================================================
      * INICIALIZAR LOS SERVOS 
