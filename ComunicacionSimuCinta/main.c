@@ -174,7 +174,10 @@ void InitPort(void);
  * que delegan en las funciones de la librería.
  */
 void HandleTX(void);
+void Inject_RX_Command(const uint8_t *trama, uint8_t len);
+void Prueba_Inyeccion_Caja_6cm(void);
 
+	
 /* RX / Protocolo */
 void DecodeCMD(uint8_t cmd);
 
@@ -191,6 +194,12 @@ void HandlePendingReplies(void);
 /* Debug */
 void UpdateDebugLEDs(void);
 void DebugQueues(void);
+void Simulador_Cinta(void);
+	
+/* Variables para simular el avance de la caja por la cinta */
+volatile uint8_t sim_paso = 0;
+volatile uint32_t sim_timer = 0;
+
 
 /* Misc */
 void TogglePin(volatile uint8_t *port, uint8_t pin);
@@ -199,6 +208,15 @@ void TogglePin(volatile uint8_t *port, uint8_t pin);
 void DoStartBotton();
 void DoStopBotton();
 void DoResetBotton();
+
+void Sensor_Trig(uint8_t state);
+uint8_t Sensor_Echo(void);
+uint32_t Sensor_GetUs(void);
+
+HCSR04_Config_t SensorCajas;
+uint32_t last_sensor_trigger; 
+
+void HCRS04();
 
 /* ============================================================
  * MACROS DE COMPATIBILIDAD
@@ -288,7 +306,7 @@ debounce_t ResetBotton = {
 
 void HandleQueue() {
     // --- TRAMO 0 (Entrada desde el Medidor 0x5F) ---
-    if (Ev.box_entry_active && !Ev.movQ0) {
+    if (Ev.box_entry_active && !Ev.movQ0){
         if (Qelements0 < MaxQueue) {
             Queue0[MaxQueue - 1 - Qelements0] = lastboxtype;
             Qelements0++;
@@ -381,11 +399,16 @@ void HandleQueue() {
         if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; DebugQueues(); }
     }
 
-    if (Ev.movQ2) {
+    if (Ev.movQ2){ 
         static uint8_t i2 = 1;
         Queue2[MaxQueue - i2] = Queue2[MaxQueue - i2 - 1];
         if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; DebugQueues(); }
     }
+	
+	
+	
+	
+	
 }
 
 /* ============================================================
@@ -625,6 +648,7 @@ void Cmd_NuevaCaja(void) {
 
     // 2. Levantamos el flag para que el while(1) sepa que hay una caja nueva
     Ev.box_entry_active = 1;
+	
 }
 
 /* ============================================================
@@ -723,6 +747,8 @@ void Protocol_DecodeCMD(uint8_t cmd,
 
 void DoStartBotton() {
     SendSimuCMD(0xF0, NULL, 0); // CMD 0xF0, sin puntero de datos, longitud
+	
+	Ev.box_entry_active = 1; 
 }
 
 void DoStopBotton() {
@@ -791,6 +817,40 @@ void DoResetBotton() {
     TxSendString("\r\n[!] RESET INTEGRAL: Software y Hardware limpios.\r\n");
 }
 
+/* Control del pin TRIGGER (Salida) */
+void Sensor_Trig(uint8_t state) {
+	if (state) PORTD |= (1 << PD7);  // Set a 1
+	else       PORTD &= ~(1 << PD7); // Reset a 0
+}
+
+/* Lectura del pin ECHO (Entrada) */
+uint8_t Sensor_Echo(void) {
+	return (PIND & (1 << PD6)) ? 1 : 0; // Enmascaramiento del bit 6
+}
+
+/* Generador continuo de microsegundos */
+uint32_t Sensor_GetUs(void) {
+    /* * Teoría de acumulación temporal:
+     * El Timer 1 (TCNT1) se reinicia a 0 cada 32.7 ms. Si el pulso de sonido
+     * viaja justo cuando ocurre este reinicio, una resta simple daría un valor
+     * negativo (corrompiendo la medición). 
+     * Al calcular el 'delta' en 16 bits sin signo, la matemática de desbordamiento 
+     * de C corrige el salto automáticamente. Luego, sumamos ese delta a un 
+     * acumulador estático de 32 bits, creando una línea de tiempo infinita y segura.
+     */
+	static uint16_t last_tcnt = 0;
+	static uint32_t accumulated_ticks = 0; // Acumulamos TICKS
+
+	uint16_t current_tcnt = TCNT1;
+	uint16_t delta_ticks = current_tcnt - last_tcnt;
+
+	accumulated_ticks += delta_ticks; // Suma sin división truncada
+	last_tcnt = current_tcnt;
+
+	return (accumulated_ticks / 2); // Devolvemos el tiempo en us
+	}
+
+
 /* ============================================================
  * DEBUG LEDs EN PUERTO A
  *   PA0 — Estado del sistema
@@ -823,34 +883,32 @@ void UpdateDebugLEDs(void) {
  *   PA1 — Actividad de actuadores (manejado en FireActuator/HandleActuators)
  * ============================================================ */
 void DebugQueues(void) {
+	TxSendString("\r\n--- ESTADO DE CINTA ---\r\n");
 
-    TxSendString("\r\n--- ESTADO DE CINTA ---\r\n");
+	// Formateamos Queue 0
+	TxSendString("Q0: [");
+	for (uint8_t i = 0; i < MaxQueue; i++) {
+		TxAddChar(Queue0[i] == 0 ? '-' : (Queue0[i] == 10 ? 'X' : Queue0[i] + '0'));
+		TxAddChar(' ');
+	}
+	TxSendString("]\r\n");
 
-    // Formateamos Queue 0
-    TxSendString("Q0: [");
-    for (uint8_t i = 0; i < MaxQueue; i++) {
-        TxAddChar(Queue0[i] == 0 ? '-' : (Queue0[i] == 10 ? 'X' : Queue0[i] + '0'));
-        TxAddChar(' ');
-    }
-    TxSendString("]\r\n");
+	// Formateamos Queue 1
+	TxSendString("Q1: [");
+	for (uint8_t i = 0; i < MaxQueue; i++) {
+		TxAddChar(Queue1[i] == 0 ? '-' : (Queue1[i] == 10 ? 'X' : Queue1[i] + '0'));
+		TxAddChar(' ');
+	}
+	TxSendString("]\r\n");
 
-    // Formateamos Queue 1
-    TxSendString("Q1: [");
-    for (uint8_t i = 0; i < MaxQueue; i++) {
-        TxAddChar(Queue1[i] == 0 ? '-' : (Queue1[i] == 10 ? 'X' : Queue1[i] + '0'));
-        TxAddChar(' ');
-    }
-    TxSendString("]\r\n");
-
-    // Formateamos Queue 2
-    TxSendString("Q2: [");
-    for (uint8_t i = 0; i < MaxQueue; i++) {
-        TxAddChar(Queue2[i] == 0 ? '-' : (Queue2[i] == 10 ? 'X' : Queue2[i] + '0'));
-        TxAddChar(' ');
-    }
-    TxSendString("]\r\n-----------------------\r\n");
+	// Formateamos Queue 2
+	TxSendString("Q2: [");
+	for (uint8_t i = 0; i < MaxQueue; i++) {
+		TxAddChar(Queue2[i] == 0 ? '-' : (Queue2[i] == 10 ? 'X' : Queue2[i] + '0'));
+		TxAddChar(' ');
+	}
+	TxSendString("]\r\n-----------------------\r\n");
 }
-
 /* ============================================================
  * INICIALIZACIONES
  * ============================================================ */
@@ -862,7 +920,7 @@ void InitUART0(void) {
     UCSR0B = (1 << RXCIE0) | (1 << RXEN0) | (1 << TXEN0);
 }
 
-void InitPort(void) {
+void InitPort(void){
     /* PB5 — Heartbeat LED (Salida) */
     DDRB |= (1 << PB5);
 	
@@ -880,6 +938,11 @@ void InitPort(void) {
 	
 	/* Configurar los puertos de los servos */
 	DDRD |= (1 << PD2) | (1 << PD3) | (1 << PD4);
+	
+	/* Configurar el HCSR04*/
+DDRD &= ~(1 << PD6); // Echo como ENTRADA
+DDRD |= (1 << PD7);  // Trigger como SALIDA
+	
 }
 
 /*
@@ -1000,8 +1063,22 @@ int main(void) {
 		SG90_SetAngle(&Servo[i], 130);
 	}
 	
-    sei();
+	/* ============================================================
+     * Inicializar el HCSR04
+     * ============================================================ */
+	last_sensor_trigger = 0;
+	SensorCajas.trigger_write = Sensor_Trig;
+	SensorCajas.echo_read     = Sensor_Echo;
+	SensorCajas.get_us        = Sensor_GetUs;
+	SensorCajas.state         = HCSR_IDLE;
 	
+	/* Inicializar la entrada del trigger en bajo */
+	PORTD &= ~(1 << PD7);
+	
+	config_salidas[0] = 6;  // El brazo 0 patea las cajas de 6cm
+	config_salidas[1] = 8;  // El brazo 1 patea las cajas de 8cm
+	config_salidas[2] = 10; // El brazo 2 patea las cajas de 10cm
+    sei();
 	
     SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
 
@@ -1009,12 +1086,124 @@ int main(void) {
      * LOOP PRINCIPAL — Completamente no bloqueante (mas o menos)
      * ============================================================ */
     while (1) {
-
         // --- TASKS ---
         Protocol_HandleUART();     /* Procesa bytes del buffer RX y llama a Protocol_DecodeCMD */
         HandlePendingReplies();    /* Despacha respuestas TX diferidas por los callbacks RX      */
         HandleActuators();
-        HandleQueue();
         UpdateDebugLEDs();
+		HandleQueue();
+		HCRS04();
+		Simulador_Cinta();
     }
+}
+
+void HCRS04() {
+	
+	/* --- TIMEOUT DE SEGURIDAD --- */
+	// Si el sensor lleva más de 100ms ocupado (no hay eco), lo reseteamos.
+	if ((SensorCajas.state != HCSR_IDLE) && ((tick_ms - last_sensor_trigger) > 100)) {
+		SensorCajas.state = HCSR_IDLE;
+	}
+
+	/* 1. INYECCIÓN DEL ESTÍMULO (Disparo periódico) */
+	// Dispara el sensor incondicionalmente cada 500ms
+	if (((tick_ms - last_sensor_trigger) >= 500) && (SensorCajas.state == HCSR_IDLE)){
+		SensorCajas.state = HCSR_TRIG_START;
+		last_sensor_trigger = tick_ms;
+	}
+
+	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS */
+	HCSR04_Process(&SensorCajas);
+	
+	/* 3. RECOLECCIÓN DEL RESULTADO */
+	
+	if (SensorCajas.state == HCSR_DATA_READY) {
+		
+		uint16_t cm = SensorCajas.distancia;
+		
+		/* Clasificación y Debug UART */
+		// Si detecta un objeto en el rango válido, levanta el evento.
+		if (cm > 2 && cm <= 6) {
+			TxSendString("\r\n>> Micro dice: 6cm\r\n");
+			lastboxtype = 6;
+			Ev.box_entry_active = 1;
+		}
+		else if (cm > 6 && cm <= 8) {
+			TxSendString("\r\n>> Micro dice: 8cm\r\n");
+			lastboxtype = 8;
+			Ev.box_entry_active = 1;
+		}
+		else if (cm > 8 && cm <= 10) {
+			TxSendString("\r\n>> Micro dice: 10cm\r\n");
+			lastboxtype = 10;
+			Ev.box_entry_active = 1;
+		}
+
+		/* ---> INICIA EL SIMULADOR DE CINTA <--- */
+		if (cm > 2 && cm <= 10) {
+			sim_paso = 1;          // Arranca el paso 1
+			sim_timer = tick_ms;   // Inicia el cronómetro
+		}
+
+/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
+SensorCajas.state = HCSR_IDLE;
+	}
+}
+
+
+void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
+	uint8_t ucsrb_respaldo = UCSR0B;
+	
+	UCSR0B &= ~(1 << RXCIE0);
+
+	for (uint8_t i = 0; i < len; i++) {
+		uint8_t next_iw = (Rx.rBuf.iw + 1) & MASK;
+		if (next_iw != Rx.rBuf.ir) {
+			Rx.rBuf.buf[Rx.rBuf.iw] = trama[i];
+			Rx.rBuf.iw = next_iw;
+		}
+	}
+	/* BORRAMOS LA LLAMADA RECURSIVA QUE ESTABA ACÁ */
+	UCSR0B = ucsrb_respaldo;
+}
+
+void Simulador_Cinta(void) {
+	static uint32_t last_sim_timer = 0;
+	
+	// Ejecutar cada 1.5 segundos (1500 ms)
+	if ((tick_ms - last_sim_timer) >= 1500) {
+		
+		// 1. Revisar si hay cajas en la Zona 0 (lista no vacía)
+		if (Qelements0 > 0) {
+			uint8_t cmd_ir0[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x00, 0x01, 0x6A};
+			Inject_RX_Command(cmd_ir0, sizeof(cmd_ir0));
+			
+			// Activar la flag correspondiente
+			Ev.ir0_active = 1;
+			TxSendString("\r\n[SIM] IR0 Inyectado y Flag Activa\r\n");
+		}
+		
+		// 2. Revisar si hay cajas en la Zona 1 (lista no vacía)
+		if (Qelements1 > 0) {
+			uint8_t cmd_ir1[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x01, 0x01, 0x6B};
+			Inject_RX_Command(cmd_ir1, sizeof(cmd_ir1));
+			
+			// Activar la flag correspondiente
+			Ev.ir1_active = 1;
+			TxSendString("\r\n[SIM] IR1 Inyectado y Flag Activa\r\n");
+		}
+		
+		// 3. Revisar si hay cajas en la Zona 2 (lista no vacía)
+		if (Qelements2 > 0) {
+			uint8_t cmd_ir2[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x02, 0x01, 0x68};
+			Inject_RX_Command(cmd_ir2, sizeof(cmd_ir2));
+			
+			// Activar la flag correspondiente
+			Ev.ir2_active = 1;
+			TxSendString("\r\n[SIM] IR2 Inyectado y Flag Activa\r\n");
+		}
+
+		// Reiniciar el cronómetro
+		last_sim_timer = tick_ms;
+	}
 }

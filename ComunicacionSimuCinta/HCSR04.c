@@ -17,7 +17,6 @@ void HCSR04_Process(HCSR04_Config_t *config) {
 				config->state = HCSR_ECHO_WAIT_HIGH;
 			}
 		break;
-
 		case HCSR_ECHO_WAIT_HIGH:
 			if (config->echo_read() == 1) {
 				config->t_ref = config->get_us();
