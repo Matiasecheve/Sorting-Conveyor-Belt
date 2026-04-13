@@ -157,10 +157,13 @@ typedef struct {
      * despacha la respuesta en la siguiente iteración del loop principal,
      * cuando HandleUART ya terminó y el buffer RX está libre.
      */
+	volatile uint8_t reply_send_alive; 
     volatile uint8_t reply_send_start;   /* 0x50 ? arrancar cinta           */
     volatile uint8_t reply_send_stop;    /* 0x51 ? confirmar detención       */
     volatile uint8_t reply_send_reset;   /* 0x53 ? confirmar reset           */
     volatile uint8_t reply_error;        /* transitar a ST_ERROR             */
+	volatile uint8_t reply_send_config;  /*Le confirmamos al que recibimos la configuracion */
+	volatile uint8_t reply_error_start; 
 	
 	/* Modo de simulacion*/
 	volatile uint8_t hw_sensors_enabled;
@@ -336,6 +339,9 @@ debounce_t ResetBotton = {
  * ============================================================ */
 
 void HandleQueue() {
+	// --- BLOQUEO DE SEGURIDAD: Si la cinta está detenida, se congela la matriz ---
+	if (sys_state != ST_RUNNING) return;
+
     // --- TRAMO 0 (Entrada desde el Medidor 0x5F) ---
     if (Ev.box_entry_active && !Ev.movQ0){
         if (Qelements0 < MaxQueue) {
@@ -517,7 +523,6 @@ void HandleActuators(void) {
                 /* Esperar otro ACT_EXTEND_MS ms para considerar el brazo disponible */
                 if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
                     Actuator[i].state = ACT_IDLE;
-                    PORTC &= ~(1 << PC1);     /* Apagar LED de clasificación */
                 }
                 break;
         }
@@ -541,20 +546,9 @@ void HandleActuators(void) {
  * por lo que respondemos encendiendo la cinta con 0x50.
  */
 void Cmd_AckAlive(void) {
-    /*
-     * NO llamamos SendSimuCMD aquí. Este callback se ejecuta dentro de
-     * Protocol_HandleUART; si enviamos el 0x50 ahora, el simulador Qt
-     * puede responder con la trama de Config antes de que HandleUART
-     * termine, saturando el buffer RX y corrompiendo el estado de la
-     * máquina de estados del protocolo.
-     * Solución: levantar un flag y dejar que HandlePendingReplies
-     * despache el 0x50 en la próxima iteración del loop principal.
-     */
     if (Rx.payload[0] == 0x0D) {
         sys_state = ST_READY;
-        Ev.reply_send_start = 1;   /* HandlePendingReplies enviará 0x50 */
-    } else {
-        Ev.reply_error = 1;        /* HandlePendingReplies transitará a ST_ERROR */
+        Ev.reply_send_alive = 1; // Respondemos con 0xF0 (No con 0x50)
     }
 }
 
@@ -564,21 +558,19 @@ void Cmd_AckAlive(void) {
  * Acción: guardar configuración y transitar a ST_RUNNING.
  */
 void Cmd_ConfigCinta(void) {
-    /*
-     * Guardamos la config 
-     */
-    config_salidas[0] = Rx.payload[1];
-    config_salidas[1] = Rx.payload[2];
-    config_salidas[2] = Rx.payload[3];
-
-    sys_state = ST_RUNNING;
+	config_salidas[0] = Rx.payload[1];
+	config_salidas[1] = Rx.payload[2];
+	config_salidas[2] = Rx.payload[3];
+	//sys_state = ST_RUNNING;
+	//Ev.reply_send_start = 1; // Mandamos el ACK 0x50 a Qt
 }
 
 /*
  * Cmd_AckStop — ACK de detención (0x51 SIMU?MICRO, payload=0x0D).
  */
 void Cmd_AckStop(void) {
-    sys_state = ST_READY;
+	sys_state = ST_READY;
+	Ev.reply_send_stop = 1; // Mandamos el ACK 0x51 a Qt
 }
 
 /*
@@ -587,11 +579,51 @@ void Cmd_AckStop(void) {
  * payload[0] = 0x0A ? no pudo resetearse
  */
 void Cmd_AckReset(void) {
-    if (Rx.payload[0] == 0x0D) {
-        sys_state = ST_IDLE;
-    } else {
-        Ev.reply_error = 1;
-    }
+	// 1. Borramos el contenido de las colas de la RAM
+	memset(Queue0, 0, sizeof(Queue0));
+	memset(Queue1, 0, sizeof(Queue1));
+	memset(Queue2, 0, sizeof(Queue2));
+	Qelements0 = 0; Qelements1 = 0; Qelements2 = 0;
+	
+	// 2. Reseteamos variables de traspaso
+	lastboxtype = 0; last_box_Q1 = 0; last_box_Q2 = 0;
+
+	// 3. Apagamos todas las banderas de eventos
+	Ev.box_entry_active = 0;
+	Ev.ir0_active = 0; Ev.ir1_active = 0; Ev.ir2_active = 0;
+	Ev.movQ0 = 0; Ev.movQ1 = 0; Ev.movQ2 = 0;
+	Ev.box_entry_Q1 = 0; Ev.box_entry_Q2 = 0;
+
+	// 4. Llevamos los servos a reposo lógico
+	for (uint8_t i = 0; i < 3; i++) {
+		Actuator[i].state = ACT_IDLE;
+		Actuator[i].timestamp_ms = 0;
+	}
+
+	// 5. Devolvemos el control al hardware físico (Protoboard)
+	Ev.hw_sensors_enabled = 1;
+
+	// 6. Pasamos a estado inicial
+	sys_state = ST_IDLE;
+	
+	// 7. Le avisamos a Qt que el micro se vació correctamente
+	// para que Qt pueda imprimir "Reset integral ejecutado" en su Log.
+	Ev.reply_send_reset = 1;
+}
+
+/*
+ * Cmd_Start — (0x50 SIMU->MICRO).
+ * Acción: Arranca la cinta (pasa a ST_RUNNING).
+ */
+void Cmd_Start(void) {
+	// Si las 3 cajas tienen un valor distinto de cero...
+	if ((config_salidas[0] != 0) && (config_salidas[1] != 0) && (config_salidas[2] != 0)) {
+		sys_state = ST_RUNNING;
+		Ev.reply_send_start = 1; // Manda el ACK 0x50 (Arranque OK)
+		} else {
+		// Si falta configuración, levantamos la bandera de error
+		Ev.reply_error_start = 1;
+	}
 }
 
 /*
@@ -600,9 +632,21 @@ void Cmd_AckReset(void) {
  * No se necesita acción adicional; el timing lo gestiona HandleActuators.
  */
 void Cmd_AckActuador(void) {
-    /* ACK recibido, la FSM de actuadores maneja el resto */
-}
+	uint8_t mask = Rx.payload[0];
+	uint8_t pos  = Rx.payload[1];
 
+	for (uint8_t i = 0; i < 3; i++) {
+		if (mask & (1 << i)) { // Si el bit correspondiente a este brazo está en 1
+			if (pos & (1 << i)) {
+				// Qt ordenó EXTENDER
+				Actuator[i].state = ACT_EXTENDING;
+				Actuator[i].timestamp_ms = tick_ms;
+				FireActuator(i, 1); // <-- 1 LÓGICO = PATEAR
+			
+			}
+		}
+	}
+}
 /*
  * Cmd_AckVelocidad — ACK del simulador al CMD 0x54.
  * payload[0] = v*10, payload[1] = 0x0D
@@ -626,7 +670,6 @@ void Cmd_AckVelocidad(void) {
  * el actuador a tiempo.
  */
 void Cmd_SensorEvent(void) {
-	
 	Ev.hw_sensors_enabled = 0; // Qt mandó un comando, le pasamos el control.
 
     uint8_t i = 0;
@@ -676,26 +719,36 @@ void Cmd_NuevaCaja(void) {
  * estado del parser RX.
  * ============================================================ */
 void HandlePendingReplies(void) {
-    if (Ev.reply_error) {
-        Ev.reply_error = 0;
-        sys_state = ST_ERROR;
-        /* Opcional: enviar trama de error al simulador si el protocolo lo define */
-    }
-
-    if (Ev.reply_send_start) {
-        Ev.reply_send_start = 0;
-        SendSimuCMD(0x50, NULL, 0);
-    }
-
-    if (Ev.reply_send_stop) {
-        Ev.reply_send_stop = 0;
-        SendSimuCMD(0x51, NULL, 0);
-    }
-
-    if (Ev.reply_send_reset) {
-        Ev.reply_send_reset = 0;
-        SendSimuCMD(0x53, NULL, 0);
-    }
+	if (Ev.reply_error) {
+		Ev.reply_error = 0;
+		sys_state = ST_ERROR;
+		SendSimuCMD(0x51,NULL, 0); // Enviamos stop 
+	}
+	if (Ev.reply_send_alive) { // <--- NUEVO
+		Ev.reply_send_alive = 0;
+		SendSimuCMD(0xF0, NULL, 0);
+	}
+	if (Ev.reply_send_start) {
+		Ev.reply_send_start = 0;
+		SendSimuCMD(0x50, NULL, 0); // Le avisamos a Qt que ya arrancamos
+	}
+	if (Ev.reply_send_stop) {
+		Ev.reply_send_stop = 0;
+		SendSimuCMD(0x51, NULL, 0); // Le avisamos a Qt que ya paramos
+	}
+	if (Ev.reply_send_reset) {
+		Ev.reply_send_reset = 0;
+		SendSimuCMD(0x53, NULL, 0); // Le avisamos a Qt del reset
+	}
+	if (Ev.reply_send_config) {
+		Ev.reply_send_config = 0;
+		// Envía el ACK (0x40) sin payload para decir "Recibido y guardado"
+		SendSimuCMD(0x40, NULL, 0);
+	}
+	if (Ev.reply_error_start) {
+		Ev.reply_error_start = 0;
+		SendSimuCMD(0x5A, NULL, 0); // 0x5A = Comando inventado para "Error de Arranque"
+	}
 }
 
 /* ============================================================
@@ -706,15 +759,17 @@ void HandlePendingReplies(void) {
  * para despachar el handler correcto al recibir una trama válida.
  * ============================================================ */
 const _sCommand command_table[] = {
-    { 0xF0, Cmd_AckAlive      },   /* ACK conexión del simulador            */
-    { 0x50, Cmd_ConfigCinta   },   /* ACK inicio + configuración de salidas */
-    { 0x51, Cmd_AckStop       },   /* ACK detención                         */
-    { 0x52, Cmd_AckActuador   },   /* ACK activación de actuador            */
-    { 0x53, Cmd_AckReset      },   /* ACK reset                             */
-    { 0x54, Cmd_AckVelocidad  },   /* ACK cambio de velocidad               */
-    { 0x5E, Cmd_SensorEvent   },   /* Evento de sensor IR                   */
-    { 0x5F, Cmd_NuevaCaja     },   /* Nueva caja medida                     */
+	{ 0xF0, Cmd_AckAlive      },
+	{ 0x40, Cmd_ConfigCinta   },   /* NUEVO: Solo configuración */
+	{ 0x50, Cmd_Start         },   /* MODIFICADO: Solo arranca la cinta */
+	{ 0x51, Cmd_AckStop       },  
+	{ 0x52, Cmd_AckActuador   },
+	{ 0x53, Cmd_AckReset      },
+	{ 0x54, Cmd_AckVelocidad  },
+	{ 0x5E, Cmd_SensorEvent   },
+	{ 0x5F, Cmd_NuevaCaja     },
 };
+
 #define MAX_COMMANDS (sizeof(command_table) / sizeof(_sCommand))
 
 /* ============================================================
@@ -907,7 +962,6 @@ void UpdateDebugLEDs(void) {
 /* ============================================================
  * DEBUG UART EN PUERTO A
  *   PA0 — Estado del sistema
- *   PA1 — Actividad de actuadores (manejado en FireActuator/HandleActuators)
  * ============================================================ */
 void DebugQueues(void) {
 	TxSendString("\r\n--- ESTADO DE CINTA ---\r\n");
@@ -1100,7 +1154,9 @@ int main(void) {
     sei();
 	
     SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
-
+	
+	Ev.hw_sensors_enabled = 1; // Establecemos como prioridad el estado de uso de hardware. 
+	
     /* ============================================================
      * LOOP PRINCIPAL — Completamente no bloqueante (mas o menos)
      * ============================================================ */
@@ -1127,12 +1183,11 @@ void HCRS04() {
 	/* 1. INYECCIÓN DEL ESTÍMULO (Disparo por Evento de Hardware) */
 	uint8_t curr_entry_ir = TCRT5000_ReadDigital(&IrEntry);
 	
-	// Si cortó el láser del PC0 Y el ultrasónico está libre: disparamos.
-	if (Ev.hw_sensors_enabled && (curr_entry_ir == 0) && (last_entry_ir == 1) && (SensorCajas.state == HCSR_IDLE)) {
+	if ((sys_state == ST_RUNNING) && Ev.hw_sensors_enabled && (curr_entry_ir == 0) && (last_entry_ir == 1) && (SensorCajas.state == HCSR_IDLE)) {
 		SensorCajas.state = HCSR_TRIG_START;
 		last_sensor_trigger = tick_ms;
 	}
-	last_entry_ir = curr_entry_ir; // Guardamos el estado
+	last_entry_ir = curr_entry_ir;
 
 	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS */
 	HCSR04_Process(&SensorCajas);
@@ -1151,6 +1206,13 @@ void HCRS04() {
 			lastboxtype = 10;
 			Ev.box_entry_active = 1;
 		}
+
+		/* --- NOTIFICAMOS A LA INTERFAZ QT --- */
+		if (cm > 2 && cm <= 10) {
+			uint8_t payload = lastboxtype;
+			SendSimuCMD(0x5F, &payload, 1); // Avisa a Qt: "Entró una caja de verdad"
+		}
+
 		/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
 		SensorCajas.state = HCSR_IDLE;
 	}
@@ -1158,26 +1220,34 @@ void HCRS04() {
 
 void HandlePhysicalIRs(void) {
 	
-	if (Ev.hw_sensors_enabled == 0) return; // Si no se estan recibiendo eventos de hw por Qt
+	// --- BLOQUEO DE SEGURIDAD: Si la cinta está detenida, se congela la matriz ---
+	if (sys_state != ST_RUNNING) return;
 	
-	// Variables estáticas para recordar el estado anterior (1 = Sin caja, 0 = Detecta caja)
+	if (Ev.hw_sensors_enabled == 0) return; // Si Qt manda, ignoramos el hardware físico
+	
 	static uint8_t last_ir0 = 1, last_ir1 = 1, last_ir2 = 1;
 	
 	uint8_t curr_ir0 = TCRT5000_ReadDigital(&IrQ0);
-	if (curr_ir0 == 0 && last_ir0 == 1) { // Flanco de bajada 
+	if (curr_ir0 == 0 && last_ir0 == 1) {
 		Ev.ir0_active = 1;
+		uint8_t pl[2] = {0x00, 0x01}; // Sensor 0, Estado 1 (Entrando)
+		SendSimuCMD(0x5E, pl, 2);     // Avisamos a Qt
 	}
 	last_ir0 = curr_ir0;
 	
 	uint8_t curr_ir1 = TCRT5000_ReadDigital(&IrQ1);
 	if (curr_ir1 == 0 && last_ir1 == 1) {
 		Ev.ir1_active = 1;
+		uint8_t pl[2] = {0x01, 0x01}; // Sensor 1, Estado 1
+		SendSimuCMD(0x5E, pl, 2);
 	}
 	last_ir1 = curr_ir1;
 	
 	uint8_t curr_ir2 = TCRT5000_ReadDigital(&IrQ2);
 	if (curr_ir2 == 0 && last_ir2 == 1) {
 		Ev.ir2_active = 1;
+		uint8_t pl[2] = {0x02, 0x01}; // Sensor 2, Estado 1
+		SendSimuCMD(0x5E, pl, 2);
 	}
 	last_ir2 = curr_ir2;
 }
@@ -1199,33 +1269,3 @@ void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
 	/* BORRAMOS LA LLAMADA RECURSIVA QUE ESTABA ACÁ */
 	UCSR0B = ucsrb_respaldo;
 }
-
-/*void Simulador_Cinta(void) {
-	static uint32_t last_sim_timer = 0;
-	
-	// Ejecutar cada 1.5 segundos (1500 ms)
-	if ((tick_ms - last_sim_timer) >= 1500) {
-		
-		// 1. Revisar si hay cajas en la Zona 0 (lista no vacía)
-		if (Qelements0 > 0) {
-			uint8_t cmd_ir0[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x00, 0x01, 0x6A};
-			//Inject_RX_Command(cmd_ir0, sizeof(cmd_ir0));
-		}
-		
-		// 2. Revisar si hay cajas en la Zona 1 (lista no vacía)
-		if (Qelements1 > 0) {
-			uint8_t cmd_ir1[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x01, 0x01, 0x6B};
-			//Inject_RX_Command(cmd_ir1, sizeof(cmd_ir1));
-
-		}
-		
-		// 3. Revisar si hay cajas en la Zona 2 (lista no vacía)
-		if (Qelements2 > 0) {
-			uint8_t cmd_ir2[] = {0x55, 0x4E, 0x45, 0x52, 0x03, 0x3A, 0x5E, 0x02, 0x01, 0x68};
-			//Inject_RX_Command(cmd_ir2, sizeof(cmd_ir2));
-
-		}
-		// Reiniciar el cronómetro
-		last_sim_timer = tick_ms;
-	}
-}*/
