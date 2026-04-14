@@ -1,4 +1,3 @@
-
 /*
  * =============================================================================
  * SISTEMA DE CLASIFICACIÓN AUTOMATIZADA DE CAJAS - ACTIVIDAD Nº3
@@ -58,6 +57,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 /*
  * Protocol_UNER.h ya incluye:
@@ -81,10 +81,11 @@
  * CONSTANTES GLOBALES
  * ============================================================
  * BUFSIZE, MASK y MAX_PAYLOAD ya vienen de Protocol_UNER.h    */
-#define ACT_EXTEND_MS   150     /* Margen sobre los 150 ms del actuador   */
-#define ACT_DELAY_MS    500
+#define ACT_EXTEND_MS   100     /* Margen sobre los 150 ms del actuador   */
+#define ACT_DELAY_MS    100
 #define DEBUG_FAST_MS   100     /* Periodo toggle PA0 en ST_RUNNING       */
 #define MaxQueue        10      /* Maximo número de cajas en cinta        */
+#define DIST_SENSOR_TO_SERVO_MM  200  // Ajustá esto a la distancia real de tu cinta
 
 /* ============================================================
  * ENUMS
@@ -135,18 +136,18 @@ typedef protocol_command_t _sCommand;
  * ============================================================ */
 typedef struct {
     /* --- Eventos de Clasificación (Los que SI usás) --- */
-    volatile uint8_t box_entry_active; // Entrada desde el medidor
-    volatile uint8_t ir0_active;       // Sensores físicos
-    volatile uint8_t ir1_active;
-    volatile uint8_t ir2_active;
+    volatile bool box_entry_active; // Entrada desde el medidor
+    volatile bool ir0_active;       // Sensores físicos
+    volatile bool ir1_active;
+    volatile bool ir2_active;
 
     /* --- Control de Tareas Multitask --- */
-    volatile uint8_t movQ0;            // Semáforos de movimiento
-    volatile uint8_t movQ1;
-    volatile uint8_t movQ2;
+    volatile bool movQ0;            // Semáforos de movimiento
+    volatile bool movQ1;
+    volatile bool movQ2;
 
-    volatile uint8_t box_entry_Q1;     // Sala de espera entre zonas
-    volatile uint8_t box_entry_Q2;
+    volatile bool box_entry_Q1;     // Sala de espera entre zonas
+    volatile bool box_entry_Q2;
     /*
      * --- Respuestas TX pendientes ---
      * Los callbacks de comandos NO deben llamar SendSimuCMD directamente
@@ -158,18 +159,20 @@ typedef struct {
      * despacha la respuesta en la siguiente iteración del loop principal,
      * cuando HandleUART ya terminó y el buffer RX está libre.
      */
-	volatile uint8_t reply_send_alive; 
-    volatile uint8_t reply_send_start;   /* 0x50 ? arrancar cinta           */
-    volatile uint8_t reply_send_stop;    /* 0x51 ? confirmar detención       */
-    volatile uint8_t reply_send_reset;   /* 0x53 ? confirmar reset           */
-    volatile uint8_t reply_error;        /* transitar a ST_ERROR             */
-	volatile uint8_t reply_send_config;  /*Le confirmamos al que recibimos la configuracion */
-	volatile uint8_t reply_error_start; 
-	volatile uint8_t reply_ack_alive;  
-	volatile uint8_t reply_send_speed_ack;
-	volatile uint8_t reply_send_timeout_ack;
+	volatile bool reply_send_alive; 
+    volatile bool reply_send_start;   /* 0x50 ? arrancar cinta           */
+    volatile bool reply_send_stop;    /* 0x51 ? confirmar detención       */
+    volatile bool reply_send_reset;   /* 0x53 ? confirmar reset           */
+    volatile bool reply_error;        /* transitar a ST_ERROR             */
+	volatile bool reply_send_config;  /*Le confirmamos al que recibimos la configuracion */
+	volatile bool reply_error_start; 
+	volatile bool reply_ack_alive;  
+	volatile bool reply_send_speed_ack;
+	volatile bool reply_send_timeout_ack;
 	/* Modo de simulacion*/
-	volatile uint8_t hw_sensors_enabled;
+	volatile bool hw_sensors_enabled;
+	/* Variable para saber si el timeout es manual (1) o automático (0) */
+	volatile bool manual_timeout_enabled;
 	
 } _sEventFlags;
 
@@ -218,6 +221,7 @@ void TogglePin(volatile uint8_t *port, uint8_t pin);
 /* Hardware */
 void HCRS04();
 void HandlePhysicalIRs(void);
+void SetTimeOutServo(void);
 
 /* Declaracion de actuadores y sensores */
 SG90_t Servo[3];
@@ -315,7 +319,7 @@ volatile uint8_t last_box_Q1 = 0, last_box_Q2 = 0;
 /* Declaracion de actuadores*/
 SG90_t Servo[3];
 
-
+uint8_t BeltVel;
 /* Manejo del debounce de los botones */
 
 debounce_t StartBotton = {
@@ -338,24 +342,6 @@ debounce_t ResetBotton = {
     .onPress = NULL,
     .onRelease = NULL
 };
-
-void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
-	uint8_t ucsrb_respaldo = UCSR0B;
-	
-	UCSR0B &= ~(1 << RXCIE0);
-
-	for (uint8_t i = 0; i < len; i++) {
-		uint8_t next_iw = (Rx.rBuf.iw + 1) & MASK;
-		if (next_iw != Rx.rBuf.ir) {
-			Rx.rBuf.buf[Rx.rBuf.iw] = trama[i];
-			Rx.rBuf.iw = next_iw;
-		}
-	}
-	
-	/* BORRAMOS LA LLAMADA RECURSIVA QUE ESTABA ACÁ */
-	UCSR0B = ucsrb_respaldo;
-}
-
 
 
 /* ============================================================
@@ -620,19 +606,19 @@ void HCRS04(){
 	if (SensorCajas.state == HCSR_DATA_READY) {
 		uint16_t cm = SensorCajas.distancia;
 		
-		if (cm > 2 && cm <= 6) {
+		if (cm > 12 && cm <= 14) {
 			lastboxtype = 6;
 			Ev.box_entry_active = 1;
-			} else if (cm > 6 && cm <= 8) {
+			} else if (cm > 10 && cm <= 11) {
 			lastboxtype = 8;
 			Ev.box_entry_active = 1;
-			} else if (cm > 8 && cm <= 10) {
+			} else if (cm > 7 && cm <= 9) {
 			lastboxtype = 10;
 			Ev.box_entry_active = 1;
 		}
 
 		/* --- NOTIFICAMOS A LA INTERFAZ QT --- */
-		if (cm > 2 && cm <= 10) {
+		if (cm > 7 && cm <= 14) {
 			uint8_t payload = lastboxtype;
 			SendSimuCMD(0x5F, &payload, 1); // Avisa a Qt: "Entró una caja de verdad"
 		}
@@ -646,6 +632,15 @@ void HCRS04(){
  * ============================================================ */
 
 /*
+ * Cmd_SetManualTimeout — (0x56 SIMU->MICRO)
+ * Payload: [0x01] Manual / [0x00] Automático
+ */
+void Cmd_SetManualTimeout(void) {
+	if (Rx.payloadLen >= 1){
+		Ev.manual_timeout_enabled = Rx.payload[0];	
+	}
+}
+/*
  * Cmd_AckAlive — Respuesta del simulador al ALIVE (0xF0 SIMU?MICRO).
  * El simulador envía payload = 0x0D.
  * Acción: transitar a ST_READY y responder con 0x50 (START) para
@@ -657,6 +652,7 @@ void HCRS04(){
  * En este callback ya estamos recibiendo el ACK del simulador,
  * por lo que respondemos encendiendo la cinta con 0x50.
  */
+
 void Cmd_AckAlive(void) {
 	// Si recibimos el 0x0D, es el ACK del simulador.
 	if (Rx.payloadLen > 0 && Rx.payload[0] == 0x0D) {
@@ -671,13 +667,16 @@ void Cmd_AckAlive(void) {
  * Acción: guardar configuración y transitar a ST_RUNNING.
  */
 void Cmd_ConfigCinta(void) {
-	config_salidas[0] = Rx.payload[1];
-	config_salidas[1] = Rx.payload[2];
-	config_salidas[2] = Rx.payload[3];
-	//sys_state = ST_RUNNING;
-	//Ev.reply_send_start = 1; // Mandamos el ACK 0x50 a Qt
+	// Verificamos que lleguen los 3 bytes desde Qt
+	if (Rx.payloadLen >= 3) {
+		config_salidas[0] = Rx.payload[0];
+		config_salidas[1] = Rx.payload[1];
+		config_salidas[2] = Rx.payload[2];
+		
+		// Levantamos la bandera para enviar el ACK
+		Ev.reply_send_config = 1;
+	}
 }
-
 /*
  * Cmd_AckStop — ACK de detención (0x51 SIMU?MICRO, payload=0x0D).
  */
@@ -699,10 +698,21 @@ void Cmd_AckReset(void) {
 	memset(Queue0, 0, sizeof(Queue0));
 	memset(Queue1, 0, sizeof(Queue1));
 	memset(Queue2, 0, sizeof(Queue2));
-	Qelements0 = 0; Qelements1 = 0; Qelements2 = 0;
-	lastboxtype = 0; last_box_Q1 = 0; last_box_Q2 = 0;
-	Ev.box_entry_active = 0; Ev.ir0_active = 0; Ev.ir1_active = 0; Ev.ir2_active = 0;
-	Ev.movQ0 = 0; Ev.movQ1 = 0; Ev.movQ2 = 0; Ev.box_entry_Q1 = 0; Ev.box_entry_Q2 = 0;
+	Qelements0 = 0;
+	Qelements1 = 0;
+	Qelements2 = 0;
+	lastboxtype = 0; 
+	last_box_Q1 = 0; 
+	last_box_Q2 = 0;
+	Ev.box_entry_active = 0; 
+	Ev.ir0_active = 0; 
+	Ev.ir1_active = 0; 
+	Ev.ir2_active = 0;
+	Ev.movQ0 = 0; 
+	Ev.movQ1 = 0; 
+	Ev.movQ2 = 0; 
+	Ev.box_entry_Q1 = 0; 
+	Ev.box_entry_Q2 = 0;
 	for (uint8_t i = 0; i < 3; i++) { Actuator[i].state = ACT_IDLE; Actuator[i].timestamp_ms = 0; }
 	Ev.hw_sensors_enabled = 1;
 	sys_state = ST_IDLE;
@@ -721,23 +731,27 @@ void Cmd_AckReset(void) {
  * START (0x50) - EXTRAE CONFIG DEL PROFE O USA LA DE QT
  * --------------------------------------------------------- */
 void Cmd_Start(void) {
-    // Si trae 4 bytes, es el Simulador del Profe inyectando la configuración
-    if (Rx.payloadLen >= 4) {
-        config_salidas[0] = Rx.payload[1]; // boxType0
-        config_salidas[1] = Rx.payload[2]; // boxType1
-        config_salidas[2] = Rx.payload[3]; // boxType2
-        sys_state = ST_RUNNING;
-        // No devolvemos nada para cortar el lazo (el profe no espera ACK acá)
-    } 
-    // Si viene vacío, es tu Qt pidiendo arrancar
-    else if (Rx.payloadLen == 0) {
-        if ((config_salidas[0] != 0) && (config_salidas[1] != 0) && (config_salidas[2] != 0)) {
-            sys_state = ST_RUNNING;
-            Ev.reply_send_start = 1; 
-        } else {
-            Ev.reply_error_start = 1;
-        }
-    }
+	// 1. MODO CÁTEDRA (Simulador del Profesor): Inyecta Velocidad + 3 Salidas
+	if (Rx.payloadLen >= 4) {
+		BeltVel = Rx.payload[0];
+		config_salidas[0] = Rx.payload[1];
+		config_salidas[1] = Rx.payload[2];
+		config_salidas[2] = Rx.payload[3];
+		
+		// recalculamos el tiempo del servo
+		SetTimeOutServo();
+		
+		sys_state = ST_RUNNING;
+	}
+	// 2. MODO QT (Tu Interfaz): Solo arranca, porque ya configuraste con 0x40 y 0x54
+	else if (Rx.payloadLen == 0) {
+		if ((config_salidas[0] != 0) && (config_salidas[1] != 0) && (config_salidas[2] != 0)) {
+			sys_state = ST_RUNNING;
+			Ev.reply_send_start = 1; // Le respondemos a Qt que arrancamos OK
+			} else {
+			Ev.reply_error_start = 1; // Avisamos a Qt que falta configuración
+		}
+	}
 }
 /*
  * Cmd_AckActuador — ACK del simulador al CMD 0x52.
@@ -776,7 +790,9 @@ void Cmd_AckActuador(void) {
  */
 void Cmd_AckVelocidad(void) {
 	if (Rx.payloadLen >= 1) {
-		uint8_t velocidad_recibida = Rx.payload[0];
+		BeltVel = Rx.payload[0];
+		SetTimeOutServo(); // Si está en Auto, esto actualiza el WaitTime y manda ACK
+		
 		if (Rx.payloadLen > 1 && Rx.payload[1] == 0x0D) return;
 		Ev.reply_send_speed_ack = 1;
 	}
@@ -839,13 +855,12 @@ void Cmd_NuevaCaja(void) {
 
 /* Modificación Dinámica del Timeout del Servo */
 void Cmd_ConfigTimeout(void) {
-	// Exigimos que lleguen los 2 bytes desde Qt
 	if (Rx.payloadLen >= 2) {
-		// Reconstruimos el entero de 16 bits (Little Endian)
-		WaitTime = (uint16_t)Rx.payload[0] | ((uint16_t)Rx.payload[1] << 8);
-		
-		// Levantamos la bandera para responder
-		Ev.reply_send_timeout_ack = 1;
+		// Solo actualizamos WaitTime si el modo manual está activado
+		if (Ev.manual_timeout_enabled) {
+			WaitTime = (uint16_t)Rx.payload[0] | ((uint16_t)Rx.payload[1] << 8);
+		}
+		SetTimeOutServo(); // Esto confirma el valor (o lo corrige si no estaba en manual)
 	}
 }
 /* ============================================================
@@ -881,8 +896,14 @@ void HandlePendingReplies(void) {
 	}
 	if (Ev.reply_send_config) {
 		Ev.reply_send_config = 0;
-		// Envía el ACK (0x40) sin payload para decir "Recibido y guardado"
-		SendSimuCMD(0x40, NULL, 0);
+	
+		uint8_t pl[3];
+		pl[0] = config_salidas[0];
+		pl[1] = config_salidas[1];
+		pl[2] = config_salidas[2];
+	
+		// Enviamos el comando 0x40 con las 3 salidas confirmadas
+		SendSimuCMD(0x40, pl, 3);
 	}
 	if (Ev.reply_error_start) {
 		Ev.reply_error_start = 0;
@@ -918,15 +939,16 @@ void HandlePendingReplies(void) {
  * ============================================================ */
 const _sCommand command_table[] = {
 	{ 0xF0, Cmd_AckAlive              },
-	{ 0x40, Cmd_ConfigCinta           },   /* NUEVO: Solo configuración */
+	{ 0x40, Cmd_ConfigCinta           },   /* Para cambiarle al voleo las configuraciones de salida */
 	{ 0x50, Cmd_Start                 },   /* MODIFICADO: Solo arranca la cinta */
-	{ 0x51, Cmd_AckStop               },  
+	{ 0x51, Cmd_AckStop               },
 	{ 0x52, Cmd_AckActuador           },
 	{ 0x53, Cmd_AckReset              },
 	{ 0x54, Cmd_AckVelocidad          },
 	{ 0x55, Cmd_ConfigTimeout         },
 	{ 0x5E, Cmd_SensorEvent           },
-	{ 0x5F, Cmd_NuevaCaja             },
+	{ 0x5F, Cmd_NuevaCaja             },	
+	{ 0x56, Cmd_SetManualTimeout      },
 };
 
 #define MAX_COMMANDS (sizeof(command_table) / sizeof(_sCommand))
@@ -1222,6 +1244,37 @@ void TogglePin(volatile uint8_t *port, uint8_t pin) {
     *port ^= (1 << pin);
 }
 
+void SetTimeOutServo(void) {
+	// Si NO está en manual, calculamos el tiempo en base a la velocidad
+	if (!Ev.manual_timeout_enabled) {
+		if (BeltVel > 0) {
+			// Fórmula cinemática optimizada: t = (d * 10) / v_recibida
+			WaitTime = (uint16_t)(((uint32_t)DIST_SENSOR_TO_SERVO_MM * 10) / BeltVel);
+		}
+	}
+	
+	// En cualquier caso (Manual o Auto), avisamos a HandlePendingReplies
+	// que despache el ACK 0x55 con el valor final de WaitTime.
+	Ev.reply_send_timeout_ack = true;
+}
+
+void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
+	uint8_t ucsrb_respaldo = UCSR0B;
+	
+	UCSR0B &= ~(1 << RXCIE0);
+
+	for (uint8_t i = 0; i < len; i++) {
+		uint8_t next_iw = (Rx.rBuf.iw + 1) & MASK;
+		if (next_iw != Rx.rBuf.ir) {
+			Rx.rBuf.buf[Rx.rBuf.iw] = trama[i];
+			Rx.rBuf.iw = next_iw;
+		}
+	}
+	
+	/* BORRAMOS LA LLAMADA RECURSIVA QUE ESTABA ACÁ */
+	UCSR0B = ucsrb_respaldo;
+}
+
 /* ============================================================
  * INTERRUPCIONES
  * ============================================================ */
@@ -1321,8 +1374,9 @@ int main(void) {
 	/* Inicializar la entrada del trigger en bajo */
 	PORTD &= ~(1 << PD7);
 	
-	WaitTime = 0;
 	
+	WaitTime = 0;
+	Ev.manual_timeout_enabled = 1;
     sei();
 	
     SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
