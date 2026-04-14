@@ -57,6 +57,7 @@
 #include <avr/interrupt.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /*
  * Protocol_UNER.h ya incluye:
@@ -76,12 +77,12 @@
 #include "SG90.h"
 #include "HCSR04.h"
 #include "TCRT5000.h"
-
 /* ============================================================
  * CONSTANTES GLOBALES
  * ============================================================
  * BUFSIZE, MASK y MAX_PAYLOAD ya vienen de Protocol_UNER.h    */
-#define ACT_EXTEND_MS   160     /* Margen sobre los 150 ms del actuador   */
+#define ACT_EXTEND_MS   150     /* Margen sobre los 150 ms del actuador   */
+#define ACT_DELAY_MS    500
 #define DEBUG_FAST_MS   100     /* Periodo toggle PA0 en ST_RUNNING       */
 #define MaxQueue        10      /* Maximo número de cajas en cinta        */
 
@@ -103,11 +104,11 @@ typedef enum {
 
 /* Estados del actuador */
 typedef enum {
-    ACT_IDLE,       /* Retraído, disponible                  */
-    ACT_EXTENDING,  /* Extendido, esperando para retraer     */
-    ACT_RETRACTING  /* Retrayendo, esperando confirmación    */
+	ACT_IDLE,       /* Retraído, disponible                  */
+	ACT_WAITING,    /* Esperando que la caja llegue al centro */
+	ACT_EXTENDING,  /* Extendido, esperando para retraer     */
+	ACT_RETRACTING  /* Retrayendo, esperando confirmación    */
 } actuator_state_t;
-
 /* ============================================================
  * ESTRUCTURAS
  * ============================================================
@@ -164,7 +165,9 @@ typedef struct {
     volatile uint8_t reply_error;        /* transitar a ST_ERROR             */
 	volatile uint8_t reply_send_config;  /*Le confirmamos al que recibimos la configuracion */
 	volatile uint8_t reply_error_start; 
-	
+	volatile uint8_t reply_ack_alive;  
+	volatile uint8_t reply_send_speed_ack;
+	volatile uint8_t reply_send_timeout_ack;
 	/* Modo de simulacion*/
 	volatile uint8_t hw_sensors_enabled;
 	
@@ -184,8 +187,7 @@ void InitPort(void);
  */
 void HandleTX(void);
 void Inject_RX_Command(const uint8_t *trama, uint8_t len);
-void Prueba_Inyeccion_Caja_6cm(void);
-
+void SendText(const char* texto);
 	
 /* RX / Protocolo */
 void DecodeCMD(uint8_t cmd);
@@ -269,6 +271,9 @@ uint32_t last_sensor_trigger;
  * Rx y Tx son extern protocol_rx_t / protocol_tx_t declarados
  * en Protocol_UNER.h y definidos en Protocol_UNER.c            */
 
+
+/* Variable dinámica para el tiempo de extensión de los actuadores */
+volatile uint16_t WaitTime = 160;
 _sActuator   Actuator[3];
 
 volatile system_state_t sys_state   = ST_IDLE;
@@ -334,6 +339,25 @@ debounce_t ResetBotton = {
     .onRelease = NULL
 };
 
+void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
+	uint8_t ucsrb_respaldo = UCSR0B;
+	
+	UCSR0B &= ~(1 << RXCIE0);
+
+	for (uint8_t i = 0; i < len; i++) {
+		uint8_t next_iw = (Rx.rBuf.iw + 1) & MASK;
+		if (next_iw != Rx.rBuf.ir) {
+			Rx.rBuf.buf[Rx.rBuf.iw] = trama[i];
+			Rx.rBuf.iw = next_iw;
+		}
+	}
+	
+	/* BORRAMOS LA LLAMADA RECURSIVA QUE ESTABA ACÁ */
+	UCSR0B = ucsrb_respaldo;
+}
+
+
+
 /* ============================================================
  *                          QUEUE
  * ============================================================ */
@@ -348,7 +372,7 @@ void HandleQueue() {
             Queue0[MaxQueue - 1 - Qelements0] = lastboxtype;
             Qelements0++;
             Ev.box_entry_active = 0;
-            DebugQueues();
+            //DebugQueues();
         }
     }
 
@@ -356,9 +380,8 @@ void HandleQueue() {
         Ev.ir0_active = 0;
         if (Qelements0 > 0) {
             if (Queue0[MaxQueue - 1] == config_salidas[0]) {
-                Actuator[0].state = ACT_EXTENDING;
+                Actuator[0].state = ACT_WAITING;
                 Actuator[0].timestamp_ms = tick_ms;
-				FireActuator(0,1);
             } else {
                 // PASO DE ESTAFETA: De zona 0 a zona 1
                 last_box_Q1 = Queue0[MaxQueue - 1];
@@ -383,9 +406,8 @@ void HandleQueue() {
         Ev.ir1_active = 0;
         if (Qelements1 > 0) {
             if (Queue1[MaxQueue - 1] == config_salidas[1]) {
-                Actuator[1].state = ACT_EXTENDING;
+                Actuator[1].state = ACT_WAITING;
                 Actuator[1].timestamp_ms = tick_ms;
-                FireActuator(1, 1);
             } else {
                 // PASO DE ESTAFETA: De zona 1 a zona 2
                 last_box_Q2 = Queue1[MaxQueue - 1];
@@ -410,9 +432,9 @@ void HandleQueue() {
         Ev.ir2_active = 0;
         if (Qelements2 > 0) {
             if (Queue2[MaxQueue - 1] == config_salidas[2]) {
-                Actuator[2].state = ACT_EXTENDING;
+                Actuator[2].state = ACT_WAITING;
                 Actuator[2].timestamp_ms = tick_ms;
-                FireActuator(2, 1);
+                
             }
             // Para Queue2, si no se patea, simplemente se elimina (descarte)
             // No hay Queue3, así que el lugar queda vacío.
@@ -495,40 +517,130 @@ void FireActuator(uint8_t outNum, uint8_t extend) {
  * Usa tick_ms para medir los 150 ms de transición.
  */
 void HandleActuators(void) {
-	
-    for (uint8_t i = 0; i < 3; i++) {
-        switch (Actuator[i].state) {
+	for (uint8_t i = 0; i < 3; i++) {
+		switch (Actuator[i].state) {
 
-            case ACT_IDLE:
-                /* Nada que hacer, esperando orden */
-                break;
+			case ACT_IDLE:
+			/* Nada que hacer, esperando que el sensor IR detecte una caja */
+			break;
 
-            case ACT_EXTENDING:
-                /* Esperar ACT_EXTEND_MS ms y luego retraer */
-                if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
-                    Actuator[i].state = ACT_RETRACTING;
-                    Actuator[i].timestamp_ms = tick_ms;
-                    FireActuator(i, 0); // Orden de retracción física
-					
-                    /* --- MENSAJE DE DEBUG PARA HÉRCULES --- */
-                    /*
-                    TxSendString("<<< RETRAYENDO BRAZO: ");
-                    TxAddChar(i + '0');
-                    TxSendString("\r\n");
-                    */
-                }
-                break;
+			case ACT_WAITING:
+			/* TIEMPO DE VUELO DE LA CAJA: Usamos la variable dinámica WaitTime.
+             * Esperamos que la caja se desplace desde el sensor hasta el actuador. */
+			if ((tick_ms - Actuator[i].timestamp_ms) >= WaitTime) {
+				Actuator[i].state = ACT_EXTENDING;
+				Actuator[i].timestamp_ms = tick_ms; // Reseteamos el reloj para la patada
+				FireActuator(i, 1); // Orden de patada física
+			}
+			break;
 
-            case ACT_RETRACTING:
-                /* Esperar otro ACT_EXTEND_MS ms para considerar el brazo disponible */
-                if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
-                    Actuator[i].state = ACT_IDLE;
-                }
-                break;
-        }
-    }
+			case ACT_EXTENDING:
+			/* TIEMPO DE ACTUACIÓN MECÁNICA: Usamos la constante ACT_EXTEND_MS.
+             * Esperamos 160ms a que el servo llegue físicamente a los 0 grados. */
+			if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
+				Actuator[i].state = ACT_RETRACTING;
+				Actuator[i].timestamp_ms = tick_ms;
+			}
+			break;
+
+			case ACT_RETRACTING:
+			/* TIEMPO DE RETRACCIÓN MECÁNICA: Usamos la constante ACT_EXTEND_MS.
+             * Esperamos 160ms a que el servo vuelva a su posición de reposo. */
+			if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
+				Actuator[i].state = ACT_IDLE;
+				FireActuator(i, 0); // Orden de patada física
+			}
+			break;
+		}
+	}
 }
 
+/* ============================================================
+ * INFRARROJOS
+ * ============================================================ */
+
+void HandlePhysicalIRs(void){
+	
+	// --- BLOQUEO DE SEGURIDAD: Si la cinta está detenida, se congela la matriz ---
+	if (sys_state != ST_RUNNING) return;
+	
+	if (Ev.hw_sensors_enabled == 0) return; // Si Qt manda, ignoramos el hardware físico
+	
+	static uint8_t last_ir0 = 1, last_ir1 = 1, last_ir2 = 1;
+	
+	uint8_t curr_ir0 = TCRT5000_ReadDigital(&IrQ0);
+	if (curr_ir0 == 0 && last_ir0 == 1) {
+		Ev.ir0_active = 1;
+		uint8_t pl[2] = {0x00, 0x01}; // Sensor 0, Estado 1 (Entrando)
+		SendSimuCMD(0x5E, pl, 2);     // Avisamos a Qt
+	}
+	last_ir0 = curr_ir0;
+	
+	uint8_t curr_ir1 = TCRT5000_ReadDigital(&IrQ1);
+	if (curr_ir1 == 0 && last_ir1 == 1) {
+		Ev.ir1_active = 1;
+		uint8_t pl[2] = {0x01, 0x01}; // Sensor 1, Estado 1
+		SendSimuCMD(0x5E, pl, 2);
+	}
+	last_ir1 = curr_ir1;
+	
+	uint8_t curr_ir2 = TCRT5000_ReadDigital(&IrQ2);
+	if (curr_ir2 == 0 && last_ir2 == 1) {
+		Ev.ir2_active = 1;
+		uint8_t pl[2] = {0x02, 0x01}; // Sensor 2, Estado 1
+		SendSimuCMD(0x5E, pl, 2);
+	}
+	last_ir2 = curr_ir2;
+}
+/* ============================================================
+ * ULTRASONICO
+ * ============================================================ */
+
+void HCRS04(){
+	static uint8_t last_entry_ir = 1;
+
+	/* --- TIMEOUT DE SEGURIDAD --- */
+	if ((SensorCajas.state != HCSR_IDLE) && ((tick_ms - last_sensor_trigger) > 100)){
+		SensorCajas.state = HCSR_IDLE;
+	}
+
+	/* 1. INYECCIÓN DEL ESTÍMULO (Disparo por Evento de Hardware) */
+	uint8_t curr_entry_ir = TCRT5000_ReadDigital(&IrEntry);
+	
+	if ((sys_state == ST_RUNNING) && Ev.hw_sensors_enabled && (curr_entry_ir == 0) && (last_entry_ir == 1) && (SensorCajas.state == HCSR_IDLE)) {
+		SensorCajas.state = HCSR_TRIG_START;
+		last_sensor_trigger = tick_ms;
+	}
+	last_entry_ir = curr_entry_ir;
+
+	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS */
+	HCSR04_Process(&SensorCajas);
+	
+	/* 3. RECOLECCIÓN DEL RESULTADO */
+	if (SensorCajas.state == HCSR_DATA_READY) {
+		uint16_t cm = SensorCajas.distancia;
+		
+		if (cm > 2 && cm <= 6) {
+			lastboxtype = 6;
+			Ev.box_entry_active = 1;
+			} else if (cm > 6 && cm <= 8) {
+			lastboxtype = 8;
+			Ev.box_entry_active = 1;
+			} else if (cm > 8 && cm <= 10) {
+			lastboxtype = 10;
+			Ev.box_entry_active = 1;
+		}
+
+		/* --- NOTIFICAMOS A LA INTERFAZ QT --- */
+		if (cm > 2 && cm <= 10) {
+			uint8_t payload = lastboxtype;
+			SendSimuCMD(0x5F, &payload, 1); // Avisa a Qt: "Entró una caja de verdad"
+		}
+
+		/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
+		SensorCajas.state = HCSR_IDLE;
+	}
+}
 /* ============================================================
  * CALLBACKS DE COMANDOS (RX desde el simulador)
  * ============================================================ */
@@ -546,10 +658,11 @@ void HandleActuators(void) {
  * por lo que respondemos encendiendo la cinta con 0x50.
  */
 void Cmd_AckAlive(void) {
-    if (Rx.payload[0] == 0x0D) {
-        sys_state = ST_READY;
-        Ev.reply_send_alive = 1; // Respondemos con 0xF0 (No con 0x50)
-    }
+	// Si recibimos el 0x0D, es el ACK del simulador.
+	if (Rx.payloadLen > 0 && Rx.payload[0] == 0x0D) {
+		sys_state = ST_READY;
+		// Fin de la transacción. NO levantamos la bandera de reply.
+	}
 }
 
 /*
@@ -570,7 +683,10 @@ void Cmd_ConfigCinta(void) {
  */
 void Cmd_AckStop(void) {
 	sys_state = ST_READY;
-	Ev.reply_send_stop = 1; // Mandamos el ACK 0x51 a Qt
+	// Si es un ACK (0x0D), la transacción terminó. Cortamos el ciclo.
+	if (Rx.payloadLen > 0 && Rx.payload[0] == 0x0D) return;
+	
+	Ev.reply_send_stop = 1; // Si no, respondemos a la orden
 }
 
 /*
@@ -579,35 +695,21 @@ void Cmd_AckStop(void) {
  * payload[0] = 0x0A ? no pudo resetearse
  */
 void Cmd_AckReset(void) {
-	// 1. Borramos el contenido de las colas de la RAM
+	// (Acá va tu código intacto de los memset y Actuator a IDLE...)
 	memset(Queue0, 0, sizeof(Queue0));
 	memset(Queue1, 0, sizeof(Queue1));
 	memset(Queue2, 0, sizeof(Queue2));
 	Qelements0 = 0; Qelements1 = 0; Qelements2 = 0;
-	
-	// 2. Reseteamos variables de traspaso
 	lastboxtype = 0; last_box_Q1 = 0; last_box_Q2 = 0;
-
-	// 3. Apagamos todas las banderas de eventos
-	Ev.box_entry_active = 0;
-	Ev.ir0_active = 0; Ev.ir1_active = 0; Ev.ir2_active = 0;
-	Ev.movQ0 = 0; Ev.movQ1 = 0; Ev.movQ2 = 0;
-	Ev.box_entry_Q1 = 0; Ev.box_entry_Q2 = 0;
-
-	// 4. Llevamos los servos a reposo lógico
-	for (uint8_t i = 0; i < 3; i++) {
-		Actuator[i].state = ACT_IDLE;
-		Actuator[i].timestamp_ms = 0;
-	}
-
-	// 5. Devolvemos el control al hardware físico (Protoboard)
+	Ev.box_entry_active = 0; Ev.ir0_active = 0; Ev.ir1_active = 0; Ev.ir2_active = 0;
+	Ev.movQ0 = 0; Ev.movQ1 = 0; Ev.movQ2 = 0; Ev.box_entry_Q1 = 0; Ev.box_entry_Q2 = 0;
+	for (uint8_t i = 0; i < 3; i++) { Actuator[i].state = ACT_IDLE; Actuator[i].timestamp_ms = 0; }
 	Ev.hw_sensors_enabled = 1;
-
-	// 6. Pasamos a estado inicial
 	sys_state = ST_IDLE;
-	
-	// 7. Le avisamos a Qt que el micro se vació correctamente
-	// para que Qt pueda imprimir "Reset integral ejecutado" en su Log.
+
+	// Si es un ACK de Éxito (0x0D) o Fallo (0x0A), cortamos el ciclo.
+	if (Rx.payloadLen > 0 && (Rx.payload[0] == 0x0D || Rx.payload[0] == 0x0A)) return;
+
 	Ev.reply_send_reset = 1;
 }
 
@@ -615,34 +717,55 @@ void Cmd_AckReset(void) {
  * Cmd_Start — (0x50 SIMU->MICRO).
  * Acción: Arranca la cinta (pasa a ST_RUNNING).
  */
+/* ---------------------------------------------------------
+ * START (0x50) - EXTRAE CONFIG DEL PROFE O USA LA DE QT
+ * --------------------------------------------------------- */
 void Cmd_Start(void) {
-	// Si las 3 cajas tienen un valor distinto de cero...
-	if ((config_salidas[0] != 0) && (config_salidas[1] != 0) && (config_salidas[2] != 0)) {
-		sys_state = ST_RUNNING;
-		Ev.reply_send_start = 1; // Manda el ACK 0x50 (Arranque OK)
-		} else {
-		// Si falta configuración, levantamos la bandera de error
-		Ev.reply_error_start = 1;
-	}
+    // Si trae 4 bytes, es el Simulador del Profe inyectando la configuración
+    if (Rx.payloadLen >= 4) {
+        config_salidas[0] = Rx.payload[1]; // boxType0
+        config_salidas[1] = Rx.payload[2]; // boxType1
+        config_salidas[2] = Rx.payload[3]; // boxType2
+        sys_state = ST_RUNNING;
+        // No devolvemos nada para cortar el lazo (el profe no espera ACK acá)
+    } 
+    // Si viene vacío, es tu Qt pidiendo arrancar
+    else if (Rx.payloadLen == 0) {
+        if ((config_salidas[0] != 0) && (config_salidas[1] != 0) && (config_salidas[2] != 0)) {
+            sys_state = ST_RUNNING;
+            Ev.reply_send_start = 1; 
+        } else {
+            Ev.reply_error_start = 1;
+        }
+    }
 }
-
 /*
  * Cmd_AckActuador — ACK del simulador al CMD 0x52.
  * payload[0] = 0xFF ? OK
  * No se necesita acción adicional; el timing lo gestiona HandleActuators.
  */
 void Cmd_AckActuador(void) {
-	uint8_t mask = Rx.payload[0];
-	uint8_t pos  = Rx.payload[1];
+	// FILTRO CORTA-LAZOS: Si el simulador del profesor responde 0xFF, es un ACK. No hacemos nada.
+	if (Rx.payloadLen == 1 && Rx.payload[0] == 0xFF) {
+		return;
+	}
 
-	for (uint8_t i = 0; i < 3; i++) {
-		if (mask & (1 << i)) { // Si el bit correspondiente a este brazo está en 1
-			if (pos & (1 << i)) {
-				// Qt ordenó EXTENDER
-				Actuator[i].state = ACT_EXTENDING;
-				Actuator[i].timestamp_ms = tick_ms;
-				FireActuator(i, 1); // <-- 1 LÓGICO = PATEAR
-			
+	// Si tiene al menos 2 bytes, es una orden manual de tu interfaz Qt
+	if (Rx.payloadLen >= 2) {
+		uint8_t mask = Rx.payload[0];
+		uint8_t pos  = Rx.payload[1];
+
+		for (uint8_t i = 0; i < 3; i++) {
+			if (mask & (1 << i)) { // Si el bit correspondiente a este brazo está en 1
+				if (pos & (1 << i)) {
+					// Qt ordenó EXTENDER
+					Actuator[i].state = ACT_WAITING;
+					Actuator[i].timestamp_ms = tick_ms;
+					} else {
+					// Qt ordenó RETRAER
+					Actuator[i].state = ACT_RETRACTING;
+					Actuator[i].timestamp_ms = tick_ms;
+				}
 			}
 		}
 	}
@@ -652,7 +775,11 @@ void Cmd_AckActuador(void) {
  * payload[0] = v*10, payload[1] = 0x0D
  */
 void Cmd_AckVelocidad(void) {
-    /* ACK de velocidad, se podría actualizar una variable local si fuera necesario */
+	if (Rx.payloadLen >= 1) {
+		uint8_t velocidad_recibida = Rx.payload[0];
+		if (Rx.payloadLen > 1 && Rx.payload[1] == 0x0D) return;
+		Ev.reply_send_speed_ack = 1;
+	}
 }
 
 /*
@@ -670,6 +797,7 @@ void Cmd_AckVelocidad(void) {
  * el actuador a tiempo.
  */
 void Cmd_SensorEvent(void) {
+	
 	Ev.hw_sensors_enabled = 0; // Qt mandó un comando, le pasamos el control.
 
     uint8_t i = 0;
@@ -709,6 +837,17 @@ void Cmd_NuevaCaja(void) {
 	
 }
 
+/* Modificación Dinámica del Timeout del Servo */
+void Cmd_ConfigTimeout(void) {
+	// Exigimos que lleguen los 2 bytes desde Qt
+	if (Rx.payloadLen >= 2) {
+		// Reconstruimos el entero de 16 bits (Little Endian)
+		WaitTime = (uint16_t)Rx.payload[0] | ((uint16_t)Rx.payload[1] << 8);
+		
+		// Levantamos la bandera para responder
+		Ev.reply_send_timeout_ack = 1;
+	}
+}
 /* ============================================================
  * DESPACHO DE RESPUESTAS TX DIFERIDAS
  * -----------------------------------------------------------------------------
@@ -724,7 +863,7 @@ void HandlePendingReplies(void) {
 		sys_state = ST_ERROR;
 		SendSimuCMD(0x51,NULL, 0); // Enviamos stop 
 	}
-	if (Ev.reply_send_alive) { // <--- NUEVO
+	if (Ev.reply_send_alive) { 
 		Ev.reply_send_alive = 0;
 		SendSimuCMD(0xF0, NULL, 0);
 	}
@@ -749,6 +888,25 @@ void HandlePendingReplies(void) {
 		Ev.reply_error_start = 0;
 		SendSimuCMD(0x5A, NULL, 0); // 0x5A = Comando inventado para "Error de Arranque"
 	}
+	if (Ev.reply_ack_alive) {
+		Ev.reply_ack_alive = 0;
+		uint8_t ack = 0x0D; // 0x0D es el código oficial de "Confirmado"
+		SendSimuCMD(0xF0, &ack, 1);
+	}
+	if (Ev.reply_send_speed_ack) {
+		Ev.reply_send_speed_ack = 0;
+		uint8_t payload_ack = 0x0D;
+		SendSimuCMD(0x54, &payload_ack, 1);
+	}
+	if (Ev.reply_send_timeout_ack) {
+		Ev.reply_send_timeout_ack = 0;
+	
+		uint8_t pl[2];
+		pl[0] = (uint8_t)(WaitTime & 0xFF);         // Byte Bajo
+		pl[1] = (uint8_t)((WaitTime >> 8) & 0xFF);  // Byte Alto
+	
+		SendSimuCMD(0x55, pl, 2);
+	}
 }
 
 /* ============================================================
@@ -759,15 +917,16 @@ void HandlePendingReplies(void) {
  * para despachar el handler correcto al recibir una trama válida.
  * ============================================================ */
 const _sCommand command_table[] = {
-	{ 0xF0, Cmd_AckAlive      },
-	{ 0x40, Cmd_ConfigCinta   },   /* NUEVO: Solo configuración */
-	{ 0x50, Cmd_Start         },   /* MODIFICADO: Solo arranca la cinta */
-	{ 0x51, Cmd_AckStop       },  
-	{ 0x52, Cmd_AckActuador   },
-	{ 0x53, Cmd_AckReset      },
-	{ 0x54, Cmd_AckVelocidad  },
-	{ 0x5E, Cmd_SensorEvent   },
-	{ 0x5F, Cmd_NuevaCaja     },
+	{ 0xF0, Cmd_AckAlive              },
+	{ 0x40, Cmd_ConfigCinta           },   /* NUEVO: Solo configuración */
+	{ 0x50, Cmd_Start                 },   /* MODIFICADO: Solo arranca la cinta */
+	{ 0x51, Cmd_AckStop               },  
+	{ 0x52, Cmd_AckActuador           },
+	{ 0x53, Cmd_AckReset              },
+	{ 0x54, Cmd_AckVelocidad          },
+	{ 0x55, Cmd_ConfigTimeout         },
+	{ 0x5E, Cmd_SensorEvent           },
+	{ 0x5F, Cmd_NuevaCaja             },
 };
 
 #define MAX_COMMANDS (sizeof(command_table) / sizeof(_sCommand))
@@ -817,7 +976,6 @@ void Protocol_DecodeCMD(uint8_t cmd,
 
 void DoStartBotton() {
     SendSimuCMD(0xF0, NULL, 0); // CMD 0xF0, sin puntero de datos, longitud
-	
 	Ev.box_entry_active = 1; 
 }
 
@@ -919,8 +1077,6 @@ uint32_t Sensor_GetUs(void) {
 
 	return (accumulated_ticks / 2); // Devolvemos el tiempo en us
 	}
-
-
 /* ============================================================
  * DEBUG LEDs EN PUERTO A
  *   PB5 — Estado del sistema
@@ -959,36 +1115,50 @@ void UpdateDebugLEDs(void) {
 	}
 }
 
+/*
+ * EnviarTextoDebug: Agarra un texto plano, mide su largo, 
+ * y lo mete adentro de una trama UNER con el comando 0x70.
+ */
+void SendText(const char* texto) {
+    uint8_t len = strlen(texto);
+    SendSimuCMD(0x70, (uint8_t*)texto, len);
+}
 /* ============================================================
  * DEBUG UART EN PUERTO A
  *   PA0 — Estado del sistema
  * ============================================================ */
 void DebugQueues(void) {
-	TxSendString("\r\n--- ESTADO DE CINTA ---\r\n");
+	char buffer[64]; // Creamos una hoja en blanco en memoria
+	char temp[8];
 
-	// Formateamos Queue 0
-	TxSendString("Q0: [");
-	for (uint8_t i = 0; i < MaxQueue; i++) {
-		TxAddChar(Queue0[i] == 0 ? '-' : (Queue0[i] == 10 ? 'X' : Queue0[i] + '0'));
-		TxAddChar(' ');
-	}
-	TxSendString("]\r\n");
+	SendText("--- ESTADO DE CINTA ---");
 
-	// Formateamos Queue 1
-	TxSendString("Q1: [");
+	// Imprimir Queue 0
+	strcpy(buffer, "Q0: [");
 	for (uint8_t i = 0; i < MaxQueue; i++) {
-		TxAddChar(Queue1[i] == 0 ? '-' : (Queue1[i] == 10 ? 'X' : Queue1[i] + '0'));
-		TxAddChar(' ');
+		sprintf(temp, "%d ", Queue0[i]);
+		strcat(buffer, temp); // Pegamos el número al final del texto
 	}
-	TxSendString("]\r\n");
+	strcat(buffer, "]");
+	SendText(buffer);
 
-	// Formateamos Queue 2
-	TxSendString("Q2: [");
+	// Imprimir Queue 1
+	strcpy(buffer, "Q1: [");
 	for (uint8_t i = 0; i < MaxQueue; i++) {
-		TxAddChar(Queue2[i] == 0 ? '-' : (Queue2[i] == 10 ? 'X' : Queue2[i] + '0'));
-		TxAddChar(' ');
-	
+		sprintf(temp, "%d ", Queue1[i]);
+		strcat(buffer, temp);
 	}
+	strcat(buffer, "]");
+	SendText(buffer);
+
+	// Imprimir Queue 2
+	strcpy(buffer, "Q2: [");
+	for (uint8_t i = 0; i < MaxQueue; i++) {
+		sprintf(temp, "%d ", Queue2[i]);
+		strcat(buffer, temp);
+	}
+	strcat(buffer, "]");
+	SendText(buffer);
 }
 /* ============================================================
  * INICIALIZACIONES
@@ -1151,6 +1321,8 @@ int main(void) {
 	/* Inicializar la entrada del trigger en bajo */
 	PORTD &= ~(1 << PD7);
 	
+	WaitTime = 0;
+	
     sei();
 	
     SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
@@ -1161,6 +1333,7 @@ int main(void) {
      * LOOP PRINCIPAL — Completamente no bloqueante (mas o menos)
      * ============================================================ */
     while (1) {
+		
         // --- TASKS ---
         Protocol_HandleUART();     /* Procesa bytes del buffer RX y llama a Protocol_DecodeCMD */
         HandlePendingReplies();    /* Despacha respuestas TX diferidas por los callbacks RX      */
@@ -1170,102 +1343,4 @@ int main(void) {
 		HCRS04();
 		HandlePhysicalIRs();
     }
-}
-
-void HCRS04() {
-	static uint8_t last_entry_ir = 1;
-
-	/* --- TIMEOUT DE SEGURIDAD --- */
-	if ((SensorCajas.state != HCSR_IDLE) && ((tick_ms - last_sensor_trigger) > 100)){
-		SensorCajas.state = HCSR_IDLE;
-	}
-
-	/* 1. INYECCIÓN DEL ESTÍMULO (Disparo por Evento de Hardware) */
-	uint8_t curr_entry_ir = TCRT5000_ReadDigital(&IrEntry);
-	
-	if ((sys_state == ST_RUNNING) && Ev.hw_sensors_enabled && (curr_entry_ir == 0) && (last_entry_ir == 1) && (SensorCajas.state == HCSR_IDLE)) {
-		SensorCajas.state = HCSR_TRIG_START;
-		last_sensor_trigger = tick_ms;
-	}
-	last_entry_ir = curr_entry_ir;
-
-	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS */
-	HCSR04_Process(&SensorCajas);
-	
-	/* 3. RECOLECCIÓN DEL RESULTADO */
-	if (SensorCajas.state == HCSR_DATA_READY) {
-		uint16_t cm = SensorCajas.distancia;
-		
-		if (cm > 2 && cm <= 6) {
-			lastboxtype = 6;
-			Ev.box_entry_active = 1;
-			} else if (cm > 6 && cm <= 8) {
-			lastboxtype = 8;
-			Ev.box_entry_active = 1;
-			} else if (cm > 8 && cm <= 10) {
-			lastboxtype = 10;
-			Ev.box_entry_active = 1;
-		}
-
-		/* --- NOTIFICAMOS A LA INTERFAZ QT --- */
-		if (cm > 2 && cm <= 10) {
-			uint8_t payload = lastboxtype;
-			SendSimuCMD(0x5F, &payload, 1); // Avisa a Qt: "Entró una caja de verdad"
-		}
-
-		/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
-		SensorCajas.state = HCSR_IDLE;
-	}
-}
-
-void HandlePhysicalIRs(void) {
-	
-	// --- BLOQUEO DE SEGURIDAD: Si la cinta está detenida, se congela la matriz ---
-	if (sys_state != ST_RUNNING) return;
-	
-	if (Ev.hw_sensors_enabled == 0) return; // Si Qt manda, ignoramos el hardware físico
-	
-	static uint8_t last_ir0 = 1, last_ir1 = 1, last_ir2 = 1;
-	
-	uint8_t curr_ir0 = TCRT5000_ReadDigital(&IrQ0);
-	if (curr_ir0 == 0 && last_ir0 == 1) {
-		Ev.ir0_active = 1;
-		uint8_t pl[2] = {0x00, 0x01}; // Sensor 0, Estado 1 (Entrando)
-		SendSimuCMD(0x5E, pl, 2);     // Avisamos a Qt
-	}
-	last_ir0 = curr_ir0;
-	
-	uint8_t curr_ir1 = TCRT5000_ReadDigital(&IrQ1);
-	if (curr_ir1 == 0 && last_ir1 == 1) {
-		Ev.ir1_active = 1;
-		uint8_t pl[2] = {0x01, 0x01}; // Sensor 1, Estado 1
-		SendSimuCMD(0x5E, pl, 2);
-	}
-	last_ir1 = curr_ir1;
-	
-	uint8_t curr_ir2 = TCRT5000_ReadDigital(&IrQ2);
-	if (curr_ir2 == 0 && last_ir2 == 1) {
-		Ev.ir2_active = 1;
-		uint8_t pl[2] = {0x02, 0x01}; // Sensor 2, Estado 1
-		SendSimuCMD(0x5E, pl, 2);
-	}
-	last_ir2 = curr_ir2;
-}
-
-
-void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
-	uint8_t ucsrb_respaldo = UCSR0B;
-	
-	UCSR0B &= ~(1 << RXCIE0);
-
-	for (uint8_t i = 0; i < len; i++) {
-		uint8_t next_iw = (Rx.rBuf.iw + 1) & MASK;
-		if (next_iw != Rx.rBuf.ir) {
-			Rx.rBuf.buf[Rx.rBuf.iw] = trama[i];
-			Rx.rBuf.iw = next_iw;
-		}
-	}
-	
-	/* BORRAMOS LA LLAMADA RECURSIVA QUE ESTABA ACÁ */
-	UCSR0B = ucsrb_respaldo;
 }

@@ -1,9 +1,9 @@
 #ifndef TCRT5000_H_
 #define TCRT5000_H_
 
+#include <stdbool.h>
 #include <avr/io.h>
 #include <stdint.h>
-#include <stdbool.h>
 
 /* Modos de operación del sensor */
 typedef enum {
