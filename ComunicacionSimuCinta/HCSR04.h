@@ -6,6 +6,7 @@
 /* Estados de la FSM del sensor */
 typedef enum {
     HCSR_IDLE,
+	HCSR_WAIT_CENTER,
     HCSR_TRIG_START,
     HCSR_TRIG_WAIT,
     HCSR_ECHO_WAIT_HIGH,
@@ -16,8 +17,12 @@ typedef enum {
 typedef void (*hcsr_write_ptr)(uint8_t state);
 typedef uint8_t (*hcsr_read_ptr)(void);
 typedef uint32_t (*hcsr_get_time_ptr)(void);
+uint32_t elapsed_us;
+
 
 typedef struct {
+	uint32_t		  enter_time; //Variable para indicar el tiempo en el cual se inició la FSM 
+	uint32_t		  wait_time_center;
     hcsr_write_ptr    trigger_write;
     hcsr_read_ptr     echo_read;
     hcsr_get_time_ptr get_us;

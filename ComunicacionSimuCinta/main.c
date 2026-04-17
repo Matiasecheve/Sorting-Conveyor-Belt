@@ -219,7 +219,7 @@ volatile uint32_t sim_timer = 0;
 void TogglePin(volatile uint8_t *port, uint8_t pin);
 
 /* Hardware */
-void HCRS04();
+void HCSR04();
 void HandlePhysicalIRs(void);
 void SetTimeOutServo(void);
 
@@ -581,49 +581,66 @@ void HandlePhysicalIRs(void){
 /* ============================================================
  * ULTRASONICO
  * ============================================================ */
+void HCSR04(void) {
+	static bool last_entry_ir = 1;
+	static uint32_t last_measurement_tick = 0;
+	static hcsr_state_t last_fsm_state = HCSR_IDLE; // Tracker para flancos lógicos de la FSM
 
-void HCRS04(){
-	static uint8_t last_entry_ir = 1;
-
-	/* --- TIMEOUT DE SEGURIDAD --- */
-	if ((SensorCajas.state != HCSR_IDLE) && ((tick_ms - last_sensor_trigger) > 100)){
-		SensorCajas.state = HCSR_IDLE;
-	}
-
-	/* 1. INYECCIÓN DEL ESTÍMULO (Disparo por Evento de Hardware) */
-	uint8_t curr_entry_ir = TCRT5000_ReadDigital(&IrEntry);
+	/* 1. DETECCIÓN DEL FLANCO DE BAJADA (Objeto detectado por IR) */
+	bool curr_entry_ir = TCRT5000_ReadDigital(&IrEntry);
 	
-	if ((sys_state == ST_RUNNING) && Ev.hw_sensors_enabled && (curr_entry_ir == 0) && (last_entry_ir == 1) && (SensorCajas.state == HCSR_IDLE)) {
-		SensorCajas.state = HCSR_TRIG_START;
+	if (/*(sys_state == ST_RUNNING) &&*/(curr_entry_ir == 0) && (last_entry_ir == 1) &&
+	(SensorCajas.state == HCSR_IDLE) &&
+	((tick_ms - last_measurement_tick) > 200)){
+		
+		SensorCajas.t_ref = SensorCajas.get_us(); // Sincronización en microsegundos
+		SensorCajas.state = HCSR_WAIT_CENTER;
+		last_measurement_tick = tick_ms;
+		// Inicializamos el trigger acá por prolijidad, aunque la Opción B lo pise luego.
 		last_sensor_trigger = tick_ms;
 	}
 	last_entry_ir = curr_entry_ir;
-
-	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS */
+	
+	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS DEL SENSOR */
+	// Acá adentro la FSM decide si cambia de WAIT_CENTER a TRIG_START
 	HCSR04_Process(&SensorCajas);
 	
-	/* 3. RECOLECCIÓN DEL RESULTADO */
+	/* 3. ACTUALIZACIÓN DINÁMICA DEL WATCHDOG (Opción B) */
+	// Evaluamos el estado INMEDIATAMENTE después de procesarlo.
+	// Detectamos la transición exacta: Terminó de esperar -> Va a disparar el pulso
+	if ((last_fsm_state == HCSR_WAIT_CENTER) && (SensorCajas.state == HCSR_TRIG_START)) {
+		last_sensor_trigger = tick_ms; // Reiniciamos el cronómetro excluyendo el wait_time_center
+	}
+	last_fsm_state = SensorCajas.state;
+
+	/* 4. TIMEOUT DE SEGURIDAD (Watchdog lógico) */
+	// Solo auditamos el cuelgue si el sensor está activamente emitiendo/escuchando
+	if ((SensorCajas.state != HCSR_IDLE) && (SensorCajas.state != HCSR_WAIT_CENTER)) {
+		if ((tick_ms - last_sensor_trigger) > 100) {
+			SensorCajas.state = HCSR_IDLE; // Abortar medición trabada
+		}
+	}
+	
+	/* 5. LECTURA Y CLASIFICACIÓN DE RESULTADOS */
 	if (SensorCajas.state == HCSR_DATA_READY) {
 		uint16_t cm = SensorCajas.distancia;
-		
-		if (cm > 12 && cm <= 14) {
-			lastboxtype = 6;
-			Ev.box_entry_active = 1;
-			} else if (cm > 10 && cm <= 11) {
-			lastboxtype = 8;
-			Ev.box_entry_active = 1;
-			} else if (cm > 7 && cm <= 9) {
-			lastboxtype = 10;
-			Ev.box_entry_active = 1;
-		}
+		uint8_t measure = 0;
 
-		/* --- NOTIFICAMOS A LA INTERFAZ QT --- */
-		if (cm > 7 && cm <= 14) {
+		/* Clasificación paramétrica */
+		if (cm >= 12 && cm <= 15) { measure = 6; }
+		else if (cm >= 9 && cm <= 11) { measure = 8; }
+		else if (cm >= 6 && cm <= 8)  { measure = 10; }
+
+		if (measure != 0) {
+			lastboxtype = measure;
+			Ev.box_entry_active = 1;
+			
+			/* Inyección al protocolo de comunicaciones */
 			uint8_t payload = lastboxtype;
-			SendSimuCMD(0x5F, &payload, 1); // Avisa a Qt: "Entró una caja de verdad"
+			SendSimuCMD(0x5F, &payload, 1);
 		}
 
-		/* LIBERACIÓN INCONDICIONAL DE LA MÁQUINA DE ESTADOS */
+		/* Liberación incondicional de los recursos */
 		SensorCajas.state = HCSR_IDLE;
 	}
 }
@@ -1358,6 +1375,8 @@ int main(void) {
      * Inicializar el HCSR04
      * ============================================================ */
 	last_sensor_trigger = 0;
+	SensorCajas.wait_time_center = 0;
+	SensorCajas.wait_time_center = 1000;
 	SensorCajas.trigger_write = Sensor_Trig;
 	SensorCajas.echo_read     = Sensor_Echo;
 	SensorCajas.get_us        = Sensor_GetUs;
@@ -1394,7 +1413,7 @@ int main(void) {
         HandleActuators();
         UpdateDebugLEDs();
 		HandleQueue();
-		HCRS04();
+		HCSR04();
 		HandlePhysicalIRs();
     }
 }
