@@ -11,16 +11,13 @@
  * - CKS: XOR acumulado desde 'U' hasta el último byte del payload.
  * - Endianness: Little Endian para valores de más de 1 byte.
  *
- * 2. ESTADOS DEL SISTEMA Y DEBUG (LEDs en Puerto C / Etiquetas A0-A1)
+ * 2. ESTADOS DEL SISTEMA Y DEBUG (LEDs en Puerto B / Etiquetas A0-A1)
  * -----------------------------------------------------------------------------
- * LED PC0 (A0) - Estado General:
+ * LED PB5 - Estado General:
  * - ST_IDLE    (0): OFF - Esperando Handshake (0xF0).
  * - ST_READY   (1): ON Fijo - Conectado, esperando Inicio (0x50).
  * - ST_RUNNING (2): Toggle Rápido (100ms) - Clasificación en proceso.
  * - ST_ERROR   (3): Toggle Lento (500ms) - Fallo de Reset o Comunicación.
- *
- * LED PC1 (A1) - Actividad:
- * - Pulso de 160ms al activar un actuador (0x52).
  *
  * 3. TRAMAS DE SIMULACIÓN (PC -> MICRO vía Hércules en HEX)
  * -----------------------------------------------------------------------------
@@ -83,7 +80,7 @@
  * BUFSIZE, MASK y MAX_PAYLOAD ya vienen de Protocol_UNER.h    */
 #define ACT_EXTEND_MS   100     /* Margen sobre los 150 ms del actuador   */
 #define ACT_DELAY_MS    100
-#define DEBUG_FAST_MS   100     /* Periodo toggle PA0 en ST_RUNNING       */
+#define DEBUG_FAST_MS   100     /* Periodo toggle PB5 en ST_RUNNING       */
 #define MaxQueue        10      /* Maximo número de cajas en cinta        */
 #define DIST_SENSOR_TO_SERVO_MM  200  // Ajustá esto a la distancia real de tu cinta
 
@@ -226,10 +223,10 @@ void SetTimeOutServo(void);
 /* Declaracion de actuadores y sensores */
 SG90_t Servo[3];
 
-TCRT5000_t IrEntry = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC0 }; // Sensor debajo del HCSR04
-TCRT5000_t IrQ0    = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC1 }; // Sensor Zona 0
-TCRT5000_t IrQ1    = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC2 }; // Sensor Zona 1
-TCRT5000_t IrQ2    = { .mode = TCRT_DIGITAL, .pin_reg = &PINC, .pin_num = PC3 };
+TCRT5000_t IrEntry = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD2 }; // Sensor debajo del HCSR04
+TCRT5000_t IrQ0    = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD3 }; // Sensor Zona 0
+TCRT5000_t IrQ1    = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD4 }; // Sensor Zona 1
+TCRT5000_t IrQ2    = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD5 }; // Sensor Zona 2
 
 void DoStartBotton();
 void DoStopBotton();
@@ -494,7 +491,7 @@ void FireActuator(uint8_t outNum, uint8_t extend) {
         TxSendString("\r\n");
     }*/
 
-    //PORTC |= (1 << PC1);
+    //PORTB |= (1 << PB1);
 }	
 
 /*
@@ -1086,13 +1083,13 @@ void DoResetBotton() {
 
 /* Control del pin TRIGGER (Salida) */
 void Sensor_Trig(uint8_t state) {
-	if (state) PORTD |= (1 << PD7);  // Set a 1
-	else       PORTD &= ~(1 << PD7); // Reset a 0
+	if (state) PORTB |= (1 << PB1);  // Set a 1 (antes era PORTD, PD7)
+	else       PORTB &= ~(1 << PB1); // Reset a 0
 }
 
 /* Lectura del pin ECHO (Entrada) */
 uint8_t Sensor_Echo(void) {
-	return (PIND & (1 << PD6)) ? 1 : 0; // Enmascaramiento del bit 6
+	return (PINB & (1 << PB2)) ? 1 : 0; // (antes era PIND, PD6)
 }
 
 /* Generador continuo de microsegundos */
@@ -1117,7 +1114,7 @@ uint32_t Sensor_GetUs(void) {
 	return (accumulated_ticks / 2); // Devolvemos el tiempo en us
 	}
 /* ============================================================
- * DEBUG LEDs EN PUERTO A
+ * DEBUG LEDs EN PUERTO B
  *   PB5 — Estado del sistema
  * ============================================================ */
 void UpdateDebugLEDs(void) {
@@ -1163,8 +1160,7 @@ void SendText(const char* texto) {
     SendSimuCMD(0x70, (uint8_t*)texto, len);
 }
 /* ============================================================
- * DEBUG UART EN PUERTO A
- *   PA0 — Estado del sistema
+ * DEBUG UART
  * ============================================================ */
 void DebugQueues(void) {
 	char buffer[64]; // Creamos una hoja en blanco en memoria
@@ -1214,20 +1210,36 @@ void InitPort(void){
 	/* PB5 — Heartbeat LED (Salida) */
 	DDRB |= (1 << PB5);
 	
-	/* --- CONFIGURACIÓN BOTONES (Mudados a PB0, PB1, PB2) --- */
-	DDRB &= ~((1 << PB0) | (1 << PB1) | (1 << PB2));  // Entradas
-	PORTB |= ((1 << PB0) | (1 << PB1) | (1 << PB2));  // Pull-ups activadas
+	/* === ACTUALIZACIÓN: Nuevos pines para TRIGGER y ECHO ===
+	 * TRIGGER: PB1 (antes PD7)
+	 * ECHO:    PB2 (antes PD6)
+	 */
+	DDRB |= (1 << PB1);       // TRIGGER como salida
+	DDRB &= ~(1 << PB2);      // ECHO como entrada
 	
-	/* --- CONFIGURACIÓN DE LOS 4 IR (PC0 a PC3) --- */
-	DDRC &= ~((1 << PC0) | (1 << PC1) | (1 << PC2) | (1 << PC3)); // Entradas
-	PORTC &= ~((1 << PC0) | (1 << PC1) | (1 << PC2) | (1 << PC3)); // SIN Pull-ups (los módulos traen las suyas)
-
-	/* Configurar los puertos de los servos */
-	DDRD |= (1 << PD2) | (1 << PD3) | (1 << PD4);
+	/* === ACTUALIZACIÓN: Botones reubicados a Puerto C ===
+	 * (antes estaban en PB0, PB1, PB2 pero PB1 y PB2 ahora son sensores)
+	 */
+	DDRC &= ~((1 << PC0) | (1 << PC1) | (1 << PC2));  // Entradas
+	PORTC |= ((1 << PC0) | (1 << PC1) | (1 << PC2));  // Pull-ups activadas
 	
-	/* Configurar el HCSR04*/
-	DDRD &= ~(1 << PD6); // Echo como ENTRADA
-	DDRD |= (1 << PD7);  // Trigger como SALIDA
+	/* === ACTUALIZACIÓN: Servos en nuevos puertos ===
+	 * SERVO 1: PD7 (antes PD2)
+	 * SERVO 2: PB4 (antes PD3)
+	 * SERVO 3: PB3 (antes PD4)
+	 */
+	DDRD |= (1 << PD7);       // SERVO 1 (PWM)
+	DDRB |= (1 << PB4);       // SERVO 2 (PWM)
+	DDRB |= (1 << PB3);       // SERVO 3 (PWM)
+	
+	/* === ACTUALIZACIÓN: Sensores IR reubicados al Puerto D ===
+	 * IrEntry (S?): PD2 (antes PC0)
+	 * IrQ0 (S?):    PD3 (antes PC1)
+	 * IrQ1 (S?):    PD4 (antes PC2)
+	 * IrQ2 (S?):    PD5 (antes PC3)
+	 */
+	DDRD &= ~((1 << PD2) | (1 << PD3) | (1 << PD4) | (1 << PD5)); // Entradas
+	PORTD &= ~((1 << PD2) | (1 << PD3) | (1 << PD4) | (1 << PD5)); // SIN Pull-ups (los módulos traen las suyas)
 }
 
 /*
@@ -1249,9 +1261,8 @@ void InitTimer0(void) {
  * 30 desbordamientos ? 983 ms ? 1 Hz para heartbeat
  */
 void InitTimer1(void) {
-    TCCR1A = 0;
-    TCCR1B = (1 << CS11);           /* Prescaler = 8     */
-    TIMSK1 = (1 << TOIE1);          /* Habilitar OVF ISR */
+	TCCR1A = 0;
+	TCCR1B = (1 << CS11);           /* Prescaler = 8     */
 }
 
 /* ============================================================
@@ -1311,14 +1322,6 @@ ISR(TIMER0_COMPA_vect) {
     tick_ms += 2;
 }
 
-/*
- * Timer1 OVF — Heartbeat LED en PB5.
- * Prescaler=8 ? OVF cada ~32 ms. 30 OVFs ? 960 ms ? 1 Hz.
- */
-ISR(TIMER1_OVF_vect) {
-
-}
-
 /* ============================================================
  * MAIN
  * ============================================================ */
@@ -1361,11 +1364,14 @@ int main(void) {
     config_salidas[2] = 0;*/
 	
 	/* ============================================================
-     * INICIALIZAR LOS SERVOS 
+     * === ACTUALIZACIÓN: INICIALIZAR LOS SERVOS EN NUEVOS PINES ===
+     * SERVO 0: PD7 (antes PD2)
+     * SERVO 1: PB4 (antes PD3)
+     * SERVO 2: PB3 (antes PD4)
      * ============================================================ */
-    SG90_Init(&Servo[0], &PORTD, PD2);
-    SG90_Init(&Servo[1], &PORTD, PD3);
-    SG90_Init(&Servo[2], &PORTD, PD4);
+    SG90_Init(&Servo[0], &PORTD, PD7);  // CAMBIO: era PD2
+    SG90_Init(&Servo[1], &PORTB, PB4);  // CAMBIO: era PD3
+    SG90_Init(&Servo[2], &PORTB, PB3);  // CAMBIO: era PD4
 	
 	for(uint8_t i = 0; i<=2; i++){
 		SG90_SetAngle(&Servo[i], 130);
@@ -1383,16 +1389,20 @@ int main(void) {
 	SensorCajas.state         = HCSR_IDLE;
 	
 	/* ============================================================
-     * INICIALIZAR LOS SENSORES IR
+     * === ACTUALIZACIÓN: INICIALIZAR LOS SENSORES IR ===
+     * (Ya actualizados en las variables globales arriba)
+     * IrEntry: PD2 (antes PC0)
+     * IrQ0:    PD3 (antes PC1)
+     * IrQ1:    PD4 (antes PC2)
+     * IrQ2:    PD5 (antes PC3)
      * ============================================================ */
     TCRT5000_Init(&IrEntry);
     TCRT5000_Init(&IrQ0);
     TCRT5000_Init(&IrQ1);
     TCRT5000_Init(&IrQ2);
 	
-	/* Inicializar la entrada del trigger en bajo */
-	PORTD &= ~(1 << PD7);
-	
+	/* === ACTUALIZACIÓN: Inicializar TRIGGER en bajo (PB1, antes PD7) === */
+	PORTB &= ~(1 << PB1);
 	
 	WaitTime = 0;
 	Ev.manual_timeout_enabled = 1;
@@ -1403,7 +1413,7 @@ int main(void) {
 	Ev.hw_sensors_enabled = 1; // Establecemos como prioridad el estado de uso de hardware. 
 	
     /* ============================================================
-     * LOOP PRINCIPAL — Completamente no bloqueante (mas o menos)
+     * LOOP PRINCIPAL — Completamente no bloqueante
      * ============================================================ */
     while (1) {
 		
