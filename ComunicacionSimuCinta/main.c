@@ -667,6 +667,9 @@ void HandleActuators(void) {
 							FireActuator(i, 1);
 							Actuator[i].state = ACT_EXTENDING;
 							Actuator[i].timestamp_ms = now;
+							
+							Ev.reply_send_BeltVel = 1; // No solo enviamos la velocidad sino 
+													   // que avisamos que cambio la queue también
 						}
 					}
 				break;
@@ -1644,9 +1647,9 @@ int main(void) {
      * SERVO 1: PB4 (antes PD3)
      * SERVO 2: PB3 (antes PD4)
      * ============================================================ */
-    SG90_Init(&Servo[0], &PORTD, PD7);  // CAMBIO: era PD2
-    SG90_Init(&Servo[1], &PORTB, PB4);  // CAMBIO: era PD3
-    SG90_Init(&Servo[2], &PORTB, PB3);  // CAMBIO: era PD4
+    SG90_Init(&Servo[0], &PORTD, PD7); 
+    SG90_Init(&Servo[1], &PORTB, PB4); 
+    SG90_Init(&Servo[2], &PORTB, PB3);  
 	
 	for(uint8_t i = 0; i<=2; i++){
 		SG90_SetAngle(&Servo[i], 130);
