@@ -355,7 +355,7 @@ void HandleQueue() {
             Queue0[MaxQueue - 1 - Qelements0] = lastboxtype;
             Qelements0++;
             Ev.box_entry_active = 0;
-            //DebugQueues();
+            DebugQueues();
         }
     }
 
@@ -432,21 +432,20 @@ void HandleQueue() {
     if (Ev.movQ0) {
         static uint8_t i0 = 1;
         Queue0[MaxQueue - i0] = Queue0[MaxQueue - i0 - 1];
-        if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; /*DebugQueues();*/ }
+        if (++i0 == MaxQueue) { Queue0[0] = 0; Ev.movQ0 = 0; i0 = 1; DebugQueues(); }
     }
 
     if (Ev.movQ1) {
         static uint8_t i1 = 1;
         Queue1[MaxQueue - i1] = Queue1[MaxQueue - i1 - 1];
-        if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; /*DebugQueues();*/ }
+        if (++i1 == MaxQueue) { Queue1[0] = 0; Ev.movQ1 = 0; i1 = 1; DebugQueues(); }
     }
 
     if (Ev.movQ2){ 
         static uint8_t i2 = 1;
         Queue2[MaxQueue - i2] = Queue2[MaxQueue - i2 - 1];
-        if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; /*DebugQueues();*/ }
+        if (++i2 == MaxQueue) { Queue2[0] = 0; Ev.movQ2 = 0; i2 = 1; DebugQueues(); }
     }
-
 }
 
 /* ============================================================
@@ -1412,7 +1411,7 @@ int main(void) {
 	
 	Ev.hw_sensors_enabled = 1; // Establecemos como prioridad el estado de uso de hardware. 
 	
-    /* ============================================================
+    /* ============================================================w
      * LOOP PRINCIPAL — Completamente no bloqueante
      * ============================================================ */
     while (1) {
