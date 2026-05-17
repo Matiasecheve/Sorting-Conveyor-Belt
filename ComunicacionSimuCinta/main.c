@@ -83,7 +83,11 @@
 #define DEBUG_FAST_MS   100     /* Periodo toggle PB5 en ST_RUNNING       */
 #define MaxQueue        10      /* Maximo número de cajas en cinta        */
 #define DIST_SENSOR_TO_SERVO_MM  200  // Ajustá esto a la distancia real de tu cinta
-
+#define ANCHO_CAJA_CM      8UL
+#define D0_CM              20UL
+#define D1_CM              40UL
+#define D2_CM              60UL
+#define KICK_FIFO_SIZE     5
 /* ============================================================
  * ENUMS
  * ============================================================ */
@@ -132,45 +136,48 @@ typedef protocol_command_t _sCommand;
  * BANDERAS DE EVENTOS (FLAGS)
  * ============================================================ */
 typedef struct {
-    /* --- Eventos de Clasificación (Los que SI usás) --- */
-    volatile bool box_entry_active; // Entrada desde el medidor
-    volatile bool ir0_active;       // Sensores físicos
-    volatile bool ir1_active;
-    volatile bool ir2_active;
+    /* =========================================================
+     * 1. MODOS DE OPERACIÓN Y CONFIGURACIÓN DEL SISTEMA
+     * ========================================================= */
+    volatile bool isMode;                 // 0 = Lazo Abierto (Tiempo) | 1 = Lazo Cerrado (IR)
+    volatile bool manual_timeout_enabled; // 0 = Timeout Automático    | 1 = Timeout Manual
+    volatile bool hw_sensors_enabled;     // 0 = Control por Qt        | 1 = Sensores físicos
 
-    /* --- Control de Tareas Multitask --- */
-    volatile bool movQ0;            // Semáforos de movimiento
-    volatile bool movQ1;
-    volatile bool movQ2;
+    /* =========================================================
+     * 2. EVENTOS DE SENSORES Y ENTRADA DE CAJAS
+     * ========================================================= */
+    volatile bool box_entry_active;       // Nueva caja detectada y clasificada en la entrada
+    volatile bool ir0_active;             // Sensor físico Zona 0 activado
+    volatile bool ir1_active;             // Sensor físico Zona 1 activado
+    volatile bool ir2_active;             // Sensor físico Zona 2 activado
 
-    volatile bool box_entry_Q1;     // Sala de espera entre zonas
-    volatile bool box_entry_Q2;
-    /*
-     * --- Respuestas TX pendientes ---
-     * Los callbacks de comandos NO deben llamar SendSimuCMD directamente
-     * porque se ejecutan dentro de Protocol_HandleUART (loop principal con
-     * interrupciones activas). Si el simulador Qt responde inmediatamente,
-     * la nueva trama entra por ISR RX mientras todavía estamos procesando
-     * la anterior, saturando el pipeline.
-     * Solución: el callback solo levanta un flag; HandlePendingReplies
-     * despacha la respuesta en la siguiente iteración del loop principal,
-     * cuando HandleUART ya terminó y el buffer RX está libre.
+    /* =========================================================
+     * 3. CONTROL DE TAREAS Y DESPLAZAMIENTO DE COLAS (QUEUES)
+     * ========================================================= */
+    volatile bool movQ0;                  // Semáforo de movimiento en Queue 0
+    volatile bool movQ1;                  // Semáforo de movimiento en Queue 1
+    volatile bool movQ2;                  // Semáforo de movimiento en Queue 2
+    volatile bool box_entry_Q1;           // Bandera de traspaso (Sala de espera): caja pasa de Q0 a Q1
+    volatile bool box_entry_Q2;           // Bandera de traspaso (Sala de espera): caja pasa de Q1 a Q2
+
+    /* =========================================================
+     * 4. RESPUESTAS TX PENDIENTES (COLA UART HACIA Qt)
+     * =========================================================
+     * Los callbacks RX solo levantan un flag. HandlePendingReplies
+     * despacha la respuesta en el loop principal cuando RX está libre.
      */
-	volatile bool reply_send_alive; 
-    volatile bool reply_send_start;   /* 0x50 ? arrancar cinta           */
-    volatile bool reply_send_stop;    /* 0x51 ? confirmar detención       */
-    volatile bool reply_send_reset;   /* 0x53 ? confirmar reset           */
-    volatile bool reply_error;        /* transitar a ST_ERROR             */
-	volatile bool reply_send_config;  /*Le confirmamos al que recibimos la configuracion */
-	volatile bool reply_error_start; 
-	volatile bool reply_ack_alive;  
-	volatile bool reply_send_speed_ack;
-	volatile bool reply_send_timeout_ack;
-	/* Modo de simulacion*/
-	volatile bool hw_sensors_enabled;
-	/* Variable para saber si el timeout es manual (1) o automático (0) */
-	volatile bool manual_timeout_enabled;
-	
+    volatile bool reply_send_alive;       // Enviar ping/alive de estado (0xF0)
+    volatile bool reply_ack_alive;        // Responder ACK al ping proveniente de Qt
+    volatile bool reply_send_start;       // Confirmar arranque de la cinta (0x50)
+    volatile bool reply_send_stop;        // Confirmar detención de la cinta (0x51)
+    volatile bool reply_send_reset;       // Confirmar reinicio de memoria y hardware (0x53)
+    volatile bool reply_send_config;      // Confirmar nueva configuración de salidas (0x40)
+    volatile bool reply_send_speed_ack;   // Confirmar cambio de velocidad manual (0x54)
+    volatile bool reply_send_timeout_ack; // Confirmar cambio de tiempo de servo (0x55)
+    volatile bool reply_send_BeltVel;     // Enviar a Qt la velocidad calculada de la cinta
+    volatile bool reply_error_start;      // Error 0x5A: Intento de arranque sin configuración
+    volatile bool reply_error;            // Transitar a ST_ERROR de forma asíncrona
+	volatile bool reply_send_mode_ack;    // Confirmar cambio de Modo (0x59)
 } _sEventFlags;
 
 /* ============================================================
@@ -206,10 +213,6 @@ void HandlePendingReplies(void);
 void UpdateDebugLEDs(void);
 void DebugQueues(void);
 void Simulador_Cinta(void);
-	
-/* Variables para simular el avance de la caja por la cinta */
-volatile uint8_t sim_paso = 0;
-volatile uint32_t sim_timer = 0;
 
 
 /* Misc */
@@ -220,8 +223,7 @@ void HCSR04();
 void HandlePhysicalIRs(void);
 void SetTimeOutServo(void);
 
-/* Declaracion de actuadores y sensores */
-SG90_t Servo[3];
+
 
 TCRT5000_t IrEntry = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD2 }; // Sensor debajo del HCSR04
 TCRT5000_t IrQ0    = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD3 }; // Sensor Zona 0
@@ -315,8 +317,22 @@ volatile uint8_t last_box_Q1 = 0, last_box_Q2 = 0;
 
 /* Declaracion de actuadores*/
 SG90_t Servo[3];
-
 uint8_t BeltVel;
+
+volatile uint32_t ir_entry_fall_ts = 0;
+volatile uint8_t ir_entry_last = 1;
+
+
+typedef struct {
+	uint32_t timestamp[KICK_FIFO_SIZE];
+	uint8_t head;
+	uint8_t tail;
+	uint8_t count;
+} kick_fifo_t;
+
+kick_fifo_t KickFIFO[3];
+
+
 /* Manejo del debounce de los botones */
 
 debounce_t StartBotton = {
@@ -341,11 +357,128 @@ debounce_t ResetBotton = {
 };
 
 
+static void KickFIFO_Push(uint8_t servo, uint32_t ts){
+	if (servo > 2) return;
+	if (KickFIFO[servo].count >= KICK_FIFO_SIZE) return;
+	KickFIFO[servo].timestamp[KickFIFO[servo].head] = ts;
+	KickFIFO[servo].head++;
+	if (KickFIFO[servo].head >= KICK_FIFO_SIZE){
+		KickFIFO[servo].head = 0;
+	}
+	KickFIFO[servo].count++;
+}
+
+static uint8_t KickFIFO_Peek(uint8_t servo, uint32_t *ts){
+	if (KickFIFO[servo].count == 0) return 0;
+	*ts = KickFIFO[servo].timestamp[KickFIFO[servo].tail];
+	return 1;
+}
+
+static void KickFIFO_Pop(uint8_t servo){
+	if (KickFIFO[servo].count == 0) return;
+	KickFIFO[servo].tail++;
+	if (KickFIFO[servo].tail >= KICK_FIFO_SIZE){
+		KickFIFO[servo].tail = 0;
+	}
+	KickFIFO[servo].count--;
+}
+
+void HandleTimeMode(void){
+
+	if (Ev.isMode != 0) return;
+	if (sys_state != ST_RUNNING) return;
+
+	uint8_t curr_ir = TCRT5000_ReadDigital(&IrEntry);
+
+	uint32_t now;
+
+	cli();
+	now = tick_ms;
+	sei();
+
+	/* =====================================================
+	 * FLANCO DE BAJADA
+	 * ===================================================== */
+	if ((curr_ir == 0) && (ir_entry_last == 1)) {
+
+		cli();
+		ir_entry_fall_ts = tick_ms;
+		sei();
+	}
+
+	/* =====================================================
+	 * FLANCO DE SUBIDA
+	 * ===================================================== */
+	if ((curr_ir == 1) && (ir_entry_last == 0)) {
+		uint32_t delta_t;
+		cli();
+		delta_t = tick_ms - ir_entry_fall_ts;
+		sei();
+		/* FILTRO ANTI-RUIDO */
+		if (delta_t >= 20) {
+			/* =========================================
+			 * VELOCIDAD
+			 * ========================================= */
+			BeltVel = (uint8_t)(((uint32_t)ANCHO_CAJA_CM * 1000UL) / delta_t);
+
+			/* AVISO A QT */
+			Ev.reply_send_BeltVel = 1;
+
+			/* =========================================
+			 * BUSCAR SERVO DESTINO
+			 * ========================================= */
+			uint8_t target = 255;
+
+			if (lastboxtype == config_salidas[0]) {
+				target = 0;
+			}
+			else if (lastboxtype == config_salidas[1]) {
+				target = 1;
+			}
+			else if (lastboxtype == config_salidas[2]) {
+				target = 2;
+			}
+
+			/* =========================================
+			 * AGENDAR PATADA
+			 * ========================================= */
+			if (target != 255 && BeltVel > 0) {
+
+				uint32_t dist_cm = 0;
+
+				switch(target){
+					case 0: dist_cm = D0_CM; break;
+					case 1: dist_cm = D1_CM; break;
+					case 2: dist_cm = D2_CM; break;
+				}
+
+				uint32_t t_vuelo =
+				(dist_cm * 1000UL) / BeltVel;
+
+				uint32_t ts_patada = now + t_vuelo;
+
+				KickFIFO_Push(target, ts_patada);
+			}
+
+			/* =========================================
+			 * AVISO VISUAL A QT
+			 * ========================================= */
+			uint8_t payload = lastboxtype;
+			SendSimuCMD(0x5F, &payload, 1);
+		}
+	}
+
+	ir_entry_last = curr_ir;
+}
+
 /* ============================================================
  *                          QUEUE
  * ============================================================ */
 
 void HandleQueue() {
+	
+	if (Ev.isMode == 0) return;
+
 	// --- BLOQUEO DE SEGURIDAD: Si la cinta está detenida, se congela la matriz ---
 	if (sys_state != ST_RUNNING) return;
 
@@ -499,39 +632,103 @@ void FireActuator(uint8_t outNum, uint8_t extend) {
  * Usa tick_ms para medir los 150 ms de transición.
  */
 void HandleActuators(void) {
+
+	uint32_t now;
+
+	/* =========================================================
+	 * LECTURA ATÓMICA DEL TICK GLOBAL
+	 * ========================================================= */
+	cli();
+	now = tick_ms;
+	sei();
+
+	/* =========================================================
+	 * MODO TIEMPO (Schedule & Fire)
+	 * =========================================================
+	 * - NO usa Queue0/1/2
+	 * - NO usa sensores IR de zona
+	 * - Solo dispara por timestamps agendados
+	 * ========================================================= */
+	if (Ev.isMode == 0) {
+		for (uint8_t i = 0; i < 3; i++) {
+			uint32_t kick_ts;
+			switch (Actuator[i].state) {
+				/* =================================================
+				 * ACT_IDLE
+				 * ================================================= */
+				case ACT_IDLE:
+					/* ¿Hay una patada pendiente para este servo? */
+					if (KickFIFO_Peek(i, &kick_ts)) {
+						/* Comparación segura para overflow */
+						if ((int32_t)(now - kick_ts) >= 0) {
+							/* Consumimos el evento */
+							KickFIFO_Pop(i);
+							/* Disparamos el servo */
+							FireActuator(i, 1);
+							Actuator[i].state = ACT_EXTENDING;
+							Actuator[i].timestamp_ms = now;
+						}
+					}
+				break;
+				/* =================================================
+				 * ACT_EXTENDING
+				 * ================================================= */
+				case ACT_EXTENDING:
+					if ((now - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
+						FireActuator(i, 0);
+						Actuator[i].state = ACT_RETRACTING;
+						Actuator[i].timestamp_ms = now;
+					}
+				break;
+				/* =================================================
+				 * ACT_RETRACTING
+				 * ================================================= */
+				case ACT_RETRACTING:
+					if ((now - Actuator[i].timestamp_ms) >= ACT_DELAY_MS) {
+						Actuator[i].state = ACT_IDLE;
+					}
+				break;
+				/* =================================================
+				 * ACT_WAITING NO SE USA EN MODO TIEMPO
+				 * ================================================= */
+				case ACT_WAITING:
+				default:
+					Actuator[i].state = ACT_IDLE;
+				break;
+			}
+		}
+		return;
+	}
+
+	/* =========================================================
+	 * MODO IR ORIGINAL
+	 * =========================================================
+	 * Se mantiene EXACTAMENTE igual que antes
+	 * ========================================================= */
 	for (uint8_t i = 0; i < 3; i++) {
 		switch (Actuator[i].state) {
-
 			case ACT_IDLE:
-			/* Nada que hacer, esperando que el sensor IR detecte una caja */
 			break;
-
 			case ACT_WAITING:
-			/* TIEMPO DE VUELO DE LA CAJA: Usamos la variable dinámica WaitTime.
-             * Esperamos que la caja se desplace desde el sensor hasta el actuador. */
-			if ((tick_ms - Actuator[i].timestamp_ms) >= WaitTime) {
-				Actuator[i].state = ACT_EXTENDING;
-				Actuator[i].timestamp_ms = tick_ms; // Reseteamos el reloj para la patada
-				FireActuator(i, 1); // Orden de patada física
-			}
-			break;
+				if ((now - Actuator[i].timestamp_ms) >= WaitTime) {
 
+					Actuator[i].state = ACT_EXTENDING;
+					Actuator[i].timestamp_ms = now;
+					FireActuator(i, 1);
+				}
+			break;
 			case ACT_EXTENDING:
-			/* TIEMPO DE ACTUACIÓN MECÁNICA: Usamos la constante ACT_EXTEND_MS.
-             * Esperamos 160ms a que el servo llegue físicamente a los 0 grados. */
-			if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
-				Actuator[i].state = ACT_RETRACTING;
-				Actuator[i].timestamp_ms = tick_ms;
-			}
-			break;
+				if ((now - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
 
+					Actuator[i].state = ACT_RETRACTING;
+					Actuator[i].timestamp_ms = now;
+				}
+			break;
 			case ACT_RETRACTING:
-			/* TIEMPO DE RETRACCIÓN MECÁNICA: Usamos la constante ACT_EXTEND_MS.
-             * Esperamos 160ms a que el servo vuelva a su posición de reposo. */
-			if ((tick_ms - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
-				Actuator[i].state = ACT_IDLE;
-				FireActuator(i, 0); // Orden de patada física
-			}
+				if ((now - Actuator[i].timestamp_ms) >= ACT_EXTEND_MS) {
+					Actuator[i].state = ACT_IDLE;
+					FireActuator(i, 0);
+				}
 			break;
 		}
 	}
@@ -623,9 +820,9 @@ void HCSR04(void) {
 		uint8_t measure = 0;
 
 		/* Clasificación paramétrica */
-		if (cm >= 12 && cm <= 15) { measure = 6; }
-		else if (cm >= 9 && cm <= 11) { measure = 8; }
-		else if (cm >= 6 && cm <= 8)  { measure = 10; }
+		if (cm > 8 && cm <= 11) { measure = 6; }
+		else if (cm > 6 && cm <= 8) { measure = 8; }
+		else if (cm >= 4 && cm <= 6)  { measure = 10; }
 
 		if (measure != 0) {
 			lastboxtype = measure;
@@ -643,6 +840,22 @@ void HCSR04(void) {
 /* ============================================================
  * CALLBACKS DE COMANDOS (RX desde el simulador)
  * ============================================================ */
+/*
+ * Cmd_SetMode — (0x59 SIMU->MICRO)
+ * Payload: [0x00] Modo Tiempo | [0x01] Modo IR
+ */
+void Cmd_SetMode(void) {
+    if (Rx.payloadLen >= 1) {
+        // Asignamos el nuevo modo (0 o 1)
+        Ev.isMode = Rx.payload[0]; 
+
+        // Levantamos la bandera para responder el ACK a Qt.
+        // NOTA: Se mantienen las colas y FIFOs intactas porque 
+        // las cajas que ya entraron siguen físicamente en la cinta.
+        Ev.reply_send_mode_ack = true;
+		
+    }
+}
 
 /*
  * Cmd_SetManualTimeout — (0x56 SIMU->MICRO)
@@ -653,6 +866,7 @@ void Cmd_SetManualTimeout(void) {
 		Ev.manual_timeout_enabled = Rx.payload[0];	
 	}
 }
+
 /*
  * Cmd_AckAlive — Respuesta del simulador al ALIVE (0xF0 SIMU?MICRO).
  * El simulador envía payload = 0x0D.
@@ -885,64 +1099,106 @@ void Cmd_ConfigTimeout(void) {
  * evitando que la respuesta inmediata del simulador Qt corrompa el
  * estado del parser RX.
  * ============================================================ */
+/* ============================================================
+ * DESPACHO DE RESPUESTAS TX DIFERIDAS
+ * -----------------------------------------------------------------------------
+ * Se llama desde el loop principal DESPUÉS de Protocol_HandleUART.
+ * Garantiza que cualquier SendSimuCMD se ejecute cuando el buffer RX
+ * está libre, evitando colisiones o saturación del pipeline.
+ * ============================================================ */
 void HandlePendingReplies(void) {
-	if (Ev.reply_error) {
-		Ev.reply_error = 0;
-		sys_state = ST_ERROR;
-		SendSimuCMD(0x51,NULL, 0); // Enviamos stop 
-	}
-	if (Ev.reply_send_alive) { 
-		Ev.reply_send_alive = 0;
-		SendSimuCMD(0xF0, NULL, 0);
-	}
-	if (Ev.reply_send_start) {
-		Ev.reply_send_start = 0;
-		SendSimuCMD(0x50, NULL, 0); // Le avisamos a Qt que ya arrancamos
-	}
-	if (Ev.reply_send_stop) {
-		Ev.reply_send_stop = 0;
-		SendSimuCMD(0x51, NULL, 0); // Le avisamos a Qt que ya paramos
-	}
-	if (Ev.reply_send_reset) {
-		Ev.reply_send_reset = 0;
-		SendSimuCMD(0x53, NULL, 0); // Le avisamos a Qt del reset
-	}
-	if (Ev.reply_send_config) {
-		Ev.reply_send_config = 0;
-	
-		uint8_t pl[3];
-		pl[0] = config_salidas[0];
-		pl[1] = config_salidas[1];
-		pl[2] = config_salidas[2];
-	
-		// Enviamos el comando 0x40 con las 3 salidas confirmadas
-		SendSimuCMD(0x40, pl, 3);
-	}
-	if (Ev.reply_error_start) {
-		Ev.reply_error_start = 0;
-		SendSimuCMD(0x5A, NULL, 0); // 0x5A = Comando inventado para "Error de Arranque"
-	}
-	if (Ev.reply_ack_alive) {
-		Ev.reply_ack_alive = 0;
-		uint8_t ack = 0x0D; // 0x0D es el código oficial de "Confirmado"
-		SendSimuCMD(0xF0, &ack, 1);
-	}
-	if (Ev.reply_send_speed_ack) {
-		Ev.reply_send_speed_ack = 0;
-		uint8_t payload_ack = 0x0D;
-		SendSimuCMD(0x54, &payload_ack, 1);
-	}
-	if (Ev.reply_send_timeout_ack) {
-		Ev.reply_send_timeout_ack = 0;
-	
-		uint8_t pl[2];
-		pl[0] = (uint8_t)(WaitTime & 0xFF);         // Byte Bajo
-		pl[1] = (uint8_t)((WaitTime >> 8) & 0xFF);  // Byte Alto
-	
-		SendSimuCMD(0x55, pl, 2);
-	}
-}
+    
+    /* =========================================================
+     * 1. ERRORES CRÍTICOS Y EXCEPCIONES 
+     * ========================================================= */
+    if (Ev.reply_error) {
+        Ev.reply_error = 0;
+        sys_state = ST_ERROR;
+        SendSimuCMD(0x51, NULL, 0); // Forzamos parada de emergencia enviando Stop
+    }
+    
+    if (Ev.reply_error_start) {
+        Ev.reply_error_start = 0;
+        SendSimuCMD(0x5A, NULL, 0); // CMD 0x5A: Error - Intento de arranque sin configuración
+    }
 
+    /* =========================================================
+     * 2. CONEXIÓN Y CONTROL DE ESTADO DEL SISTEMA
+     * ========================================================= */
+    if (Ev.reply_send_alive) { 
+        Ev.reply_send_alive = 0;
+        SendSimuCMD(0xF0, NULL, 0); // Ping saliente del Micro hacia Qt
+    }
+    
+    if (Ev.reply_ack_alive) {
+        Ev.reply_ack_alive = 0;
+        uint8_t ack = 0x0D; 
+        SendSimuCMD(0xF0, &ack, 1); // ACK (0x0D) respondiendo al Ping de Qt
+    }
+    
+    if (Ev.reply_send_start) {
+        Ev.reply_send_start = 0;
+        SendSimuCMD(0x50, NULL, 0); // Confirmamos a Qt que la cinta arrancó
+    }
+    
+    if (Ev.reply_send_stop) {
+        Ev.reply_send_stop = 0;
+        SendSimuCMD(0x51, NULL, 0); // Confirmamos a Qt que la cinta se detuvo
+    }
+    
+    if (Ev.reply_send_reset) {
+        Ev.reply_send_reset = 0;
+        SendSimuCMD(0x53, NULL, 0); // Confirmamos a Qt que la memoria fue borrada
+    }
+
+    /* =========================================================
+     * 3. CONFIRMACIONES DE CONFIGURACIÓN Y MODOS
+     * ========================================================= */
+    if (Ev.reply_send_mode_ack) {
+        Ev.reply_send_mode_ack = 0; 
+        uint8_t payload = Ev.isMode; 
+        SendSimuCMD(0x59, &payload, 1); // Confirmamos cambio de modo (0=Tiempo, 1=IR)
+    }
+
+    if (Ev.reply_send_config) {
+        Ev.reply_send_config = 0;
+        uint8_t pl[3];
+        pl[0] = config_salidas[0];
+        pl[1] = config_salidas[1];
+        pl[2] = config_salidas[2];
+        SendSimuCMD(0x40, pl, 3);       // Confirmamos los tamaños asignados a las salidas
+    }
+    
+    if (Ev.reply_send_speed_ack) {
+        Ev.reply_send_speed_ack = 0;
+        uint8_t payload_ack = 0x0D;
+        SendSimuCMD(0x54, &payload_ack, 1); // Confirmamos cambio manual de velocidad
+    }
+    
+    if (Ev.reply_send_timeout_ack) {
+        Ev.reply_send_timeout_ack = 0;
+        uint8_t pl[2];
+        pl[0] = (uint8_t)(WaitTime & 0xFF);         // Byte Bajo del tiempo de reacción
+        pl[1] = (uint8_t)((WaitTime >> 8) & 0xFF);  // Byte Alto del tiempo de reacción
+        SendSimuCMD(0x55, pl, 2);       // Confirmamos nuevo tiempo de WaitTime
+    }
+
+	/* =========================================================
+     * 4. TELEMETRÍA Y CINEMÁTICA EN TIEMPO REAL
+     * ========================================================= */
+    if (Ev.reply_send_BeltVel) {
+        Ev.reply_send_BeltVel = 0;
+        
+        uint8_t pl[5];
+        pl[0] = BeltVel;              // Byte 0: Velocidad calculada en cm/s
+        pl[1] = lastboxtype;          // Byte 1: Tamaño de la caja (6, 8 o 10)
+        pl[2] = KickFIFO[0].count;    // Byte 2: Cantidad de patadas pendientes en S0
+        pl[3] = KickFIFO[1].count;    // Byte 3: Cantidad de patadas pendientes en S1
+        pl[4] = KickFIFO[2].count;    // Byte 4: Cantidad de patadas pendientes en S2
+        
+        SendSimuCMD(0x58, pl, 5);     // Enviamos la actualización con 5 bytes
+    }
+}
 /* ============================================================
  * TABLA DE COMANDOS
  * -----------------------------------------------------------------------------
@@ -951,18 +1207,35 @@ void HandlePendingReplies(void) {
  * para despachar el handler correcto al recibir una trama válida.
  * ============================================================ */
 const _sCommand command_table[] = {
-	{ 0xF0, Cmd_AckAlive              },
-	{ 0x40, Cmd_ConfigCinta           },   /* Para cambiarle al voleo las configuraciones de salida */
-	{ 0x50, Cmd_Start                 },   /* MODIFICADO: Solo arranca la cinta */
-	{ 0x51, Cmd_AckStop               },
-	{ 0x52, Cmd_AckActuador           },
-	{ 0x53, Cmd_AckReset              },
-	{ 0x54, Cmd_AckVelocidad          },
-	{ 0x55, Cmd_ConfigTimeout         },
-	{ 0x5E, Cmd_SensorEvent           },
-	{ 0x5F, Cmd_NuevaCaja             },	
-	{ 0x56, Cmd_SetManualTimeout      },
+    /* =========================================================
+     * 1. CONTROL DE SISTEMA Y CONEXIÓN (HANDSHAKE)
+     * ========================================================= */
+    { 0xF0, Cmd_AckAlive              },   /* Ping / Conexión establecida */
+    { 0x50, Cmd_Start                 },   /* Arrancar la cinta */
+    { 0x51, Cmd_AckStop               },   /* Detener la cinta */
+    { 0x53, Cmd_AckReset              },   /* Reinicio de memoria y hardware */
+
+    /* =========================================================
+     * 2. MODOS DE OPERACIÓN Y CONFIGURACIÓN PARÁMETROS
+     * ========================================================= */
+    { 0x59, Cmd_SetMode               },   /* Cambiar Modo (0=Tiempo/Abierto, 1=IR/Cerrado) */
+    { 0x40, Cmd_ConfigCinta           },   /* Asignar qué tamaño de caja va a cada salida */
+    { 0x54, Cmd_AckVelocidad          },   /* Modificar velocidad manual (BeltVel) */
+    { 0x56, Cmd_SetManualTimeout      },   /* Alternar Timeout Automático vs Manual */
+    { 0x55, Cmd_ConfigTimeout         },   /* Modificar el tiempo de reacción/espera del servo */
+
+    /* =========================================================
+     * 3. EVENTOS DE HARDWARE Y SENSORES (SIMULADOS O FÍSICOS)
+     * ========================================================= */
+    { 0x5F, Cmd_NuevaCaja             },   /* Ingreso: Ultrasónico midió una caja en la entrada */
+    { 0x5E, Cmd_SensorEvent           },   /* Tránsito: Se tapó/destapó un sensor IR de zona */
+
+    /* =========================================================
+     * 4. CONTROL MANUAL DE ACTUADORES
+     * ========================================================= */
+    { 0x52, Cmd_AckActuador           },   /* Orden forzada para patear o retraer un brazo */
 };
+
 
 #define MAX_COMMANDS (sizeof(command_table) / sizeof(_sCommand))
 
@@ -1227,6 +1500,7 @@ void InitPort(void){
 	 * SERVO 2: PB4 (antes PD3)
 	 * SERVO 3: PB3 (antes PD4)
 	 */
+	
 	DDRD |= (1 << PD7);       // SERVO 1 (PWM)
 	DDRB |= (1 << PB4);       // SERVO 2 (PWM)
 	DDRB |= (1 << PB3);       // SERVO 3 (PWM)
@@ -1238,7 +1512,9 @@ void InitPort(void){
 	 * IrQ2 (S?):    PD5 (antes PC3)
 	 */
 	DDRD &= ~((1 << PD2) | (1 << PD3) | (1 << PD4) | (1 << PD5)); // Entradas
-	PORTD &= ~((1 << PD2) | (1 << PD3) | (1 << PD4) | (1 << PD5)); // SIN Pull-ups (los módulos traen las suyas)
+	
+	//Activamos las Pull-ups internas para evitar ruido fantasma
+	PORTD |= ((1 << PD2) | (1 << PD3) | (1 << PD4) | (1 << PD5));
 }
 
 /*
@@ -1410,19 +1686,37 @@ int main(void) {
     SendSimuCMD(0xF0, NULL, 0); // Mandamos al comienzo de cada reset el estado IDLE
 	
 	Ev.hw_sensors_enabled = 1; // Establecemos como prioridad el estado de uso de hardware. 
-	
-    /* ============================================================w
+	Ev.isMode = 1; 
+    /* ============================================================
      * LOOP PRINCIPAL — Completamente no bloqueante
      * ============================================================ */
-    while (1) {
-		
-        // --- TASKS ---
-        Protocol_HandleUART();     /* Procesa bytes del buffer RX y llama a Protocol_DecodeCMD */
-        HandlePendingReplies();    /* Despacha respuestas TX diferidas por los callbacks RX      */
-        HandleActuators();
-        UpdateDebugLEDs();
-		HandleQueue();
-		HCSR04();
-		HandlePhysicalIRs();
-    }
+	while (1) {
+			/* =========================================================
+			 * FASE 1: ENTRADAS (Comunicaciones y Sensores Físicos)
+			 * Recolectamos toda la información del mundo exterior primero.
+			 * ========================================================= */
+			Protocol_HandleUART();     // 1.1 Leer comandos de Qt (puede cambiar modos o estados)
+			HCSR04();                  // 1.2 Leer Ultrasónico e IR de entrada (Mide/Clasifica)
+			HandlePhysicalIRs();       // 1.3 Leer IRs de las zonas (Si estamos en Modo IR)
+
+			/* =========================================================
+			 * FASE 2: PROCESAMIENTO (Lógica y Máquinas de Estado)
+			 * Tomamos decisiones basados en las entradas frescas.
+			 * ========================================================= */
+			HandleTimeMode();          // 2.1 Calcula velocidades y genera triggers virtuales (Modo Tiempo)
+			HandleQueue();             // 2.2 Desplaza las cajas y decide a qué servo le toca patear
+
+			/* =========================================================
+			 * FASE 3: SALIDAS (Actuadores y Respuestas UART)
+			 * Ejecutamos las acciones físicas y avisamos a la HMI.
+			 * ========================================================= */
+			HandleActuators();         // 3.1 Mueve físicamente los servos (Si la FASE 2 lo ordenó)
+			HandlePendingReplies();    // 3.2 Envía ACKs, telemetría y velocidades a Qt
+
+			/* =========================================================
+			 * FASE 4: MANTENIMIENTO (Housekeeping / Debug)
+			 * Tareas no críticas.
+			 * ========================================================= */
+			UpdateDebugLEDs();         // 4.1 Parpadeo del LED de estado en PB5
+		}
 }
