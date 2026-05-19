@@ -140,7 +140,7 @@ typedef struct {
     volatile bool isMode;                 // 0 = Lazo Abierto (Tiempo) | 1 = Lazo Cerrado (IR)
     volatile bool manual_timeout_enabled; // 0 = Timeout Automático    | 1 = Timeout Manual
     volatile bool hw_sensors_enabled;     // 0 = Control por Qt        | 1 = Sensores físicos
-
+	volatile bool manual_measure;         // Qt solicitó una medida con el ultrasonico 
     /* =========================================================
      * 2. EVENTOS DE SENSORES Y ENTRADA DE CAJAS
      * ========================================================= */
@@ -180,6 +180,7 @@ typedef struct {
 	volatile bool reply_send_manual_timeout_ack;  // Confirmar cambio Manual/Auto (0x56)
 	volatile bool reply_send_wait_center_ack; // Confirmar WaitCenter (0x57)
 	volatile bool reply_send_act_times_ack; // Confirmar tiempos de servo (0x62)
+	volatile bool reply_send_manual_measure; // Enviar respuesta de medición forzada (0x63)
 } _sEventFlags;
 
 /* ============================================================
@@ -327,6 +328,10 @@ uint8_t BeltVel;
 /* Tiempos de Actuadores Dinámicos */
 volatile uint16_t ActExtendMs = 300;
 volatile uint16_t ActDelayMs = 100;
+
+
+
+volatile uint8_t manual_measured_distance = 0;
 
 /* Límites dinámicos del sensor ultrasónico (Configurables vía CMD 0x60) */
 volatile uint8_t min_6cm  = 14;
@@ -778,58 +783,79 @@ void HCSR04(void) {
 	static uint32_t last_measurement_tick = 0;
 	static hcsr_state_t last_fsm_state = HCSR_IDLE; // Tracker para flancos lógicos de la FSM
 
-	/* 1. DETECCIÓN DEL FLANCO DE BAJADA (Objeto detectado por IR) */
+	/* 1. DETECCIÓN DEL GATILLO (Objeto detectado por IR FÍSICO o SOLICITUD MANUAL por bandera) */
 	bool curr_entry_ir = TCRT5000_ReadDigital(&IrEntry);
 	
-	if (/*(sys_state == ST_RUNNING) &&*/(curr_entry_ir == 0) && (last_entry_ir == 1) &&
+	// Se dispara si el IR físico va a cero O si desde Qt levantaron la bandera Ev.manual_measure
+	if (((curr_entry_ir == 0) || Ev.manual_measure) && (last_entry_ir == 1 || Ev.manual_measure) &&
 	(SensorCajas.state == HCSR_IDLE) &&
 	((tick_ms - last_measurement_tick) > 200)){
 		
 		SensorCajas.t_ref = SensorCajas.get_us(); // Sincronización en microsegundos
 		SensorCajas.state = HCSR_WAIT_CENTER;
 		last_measurement_tick = tick_ms;
-		// Inicializamos el trigger acá por prolijidad, aunque la Opción B lo pise luego.
 		last_sensor_trigger = tick_ms;
 	}
 	last_entry_ir = curr_entry_ir;
 	
 	/* 2. PROCESAMIENTO DE LA MÁQUINA DE ESTADOS DEL SENSOR */
-	// Acá adentro la FSM decide si cambia de WAIT_CENTER a TRIG_START
 	HCSR04_Process(&SensorCajas);
 	
-	/* 3. ACTUALIZACIÓN DINÁMICA DEL WATCHDOG (Opción B) */
-	// Evaluamos el estado INMEDIATAMENTE después de procesarlo.
-	// Detectamos la transición exacta: Terminó de esperar -> Va a disparar el pulso
+	/* 3. ACTUALIZACIÓN DINÁMICA DEL WATCHDOG */
 	if ((last_fsm_state == HCSR_WAIT_CENTER) && (SensorCajas.state == HCSR_TRIG_START)) {
-		last_sensor_trigger = tick_ms; // Reiniciamos el cronómetro excluyendo el wait_time_center
+		last_sensor_trigger = tick_ms;
 	}
 	last_fsm_state = SensorCajas.state;
 
 	/* 4. TIMEOUT DE SEGURIDAD (Watchdog lógico) */
-	// Solo auditamos el cuelgue si el sensor está activamente emitiendo/escuchando
 	if ((SensorCajas.state != HCSR_IDLE) && (SensorCajas.state != HCSR_WAIT_CENTER)) {
 		if ((tick_ms - last_sensor_trigger) > 100) {
-			SensorCajas.state = HCSR_IDLE; // Abortar medición trabada
+			
+			// Si hubo timeout y estábamos midiendo manualmente, avisamos error a Qt (0 cm)
+			if (Ev.manual_measure) {
+				Ev.manual_measure = 0;
+				uint8_t error_payload = 0;
+				SendSimuCMD(0x63, &error_payload, 1);
+			}
+			SensorCajas.state = HCSR_IDLE;
 		}
 	}
 	
 	/* 5. LECTURA Y CLASIFICACIÓN DE RESULTADOS */
 	if (SensorCajas.state == HCSR_DATA_READY) {
 		uint16_t cm = SensorCajas.distancia;
-		uint8_t measure = 0;
 
-		/* Clasificación paramétrica dinámica */
-		if (cm >= min_6cm && cm <= max_6cm) { measure = 6; }
-		else if (cm >= min_8cm && cm <= max_8cm) { measure = 8; }
-		else if (cm >= min_10cm && cm <= max_10cm)  { measure = 10; }
+		// --- ¡NUEVO! TELEMETRÍA CRUDA INCONDICIONAL ---
+		// Enviamos siempre la lectura cruda al log de Qt para ver exactamente qué lee el sensor.
+		char debug_msg[3];
+		sprintf(debug_msg, "%u", cm);
+		SendText(debug_msg);
 
-		if (measure != 0) {
-			lastboxtype = measure;
-			Ev.box_entry_active = 1;
-			
-			/* Inyección al protocolo de comunicaciones */
-			uint8_t payload = lastboxtype;
-			SendSimuCMD(0x5F, &payload, 1);
+		// CAMINO A: Si fue una solicitud MANUAL desde el botón "Medir" de Qt
+		if (Ev.manual_measure) {
+			Ev.manual_measure = 0; // Bajamos la bandera de control
+			uint8_t payload_manual = (uint8_t)cm;
+			SendSimuCMD(0x63, &payload_manual, 1); // Respondemos con la distancia exacta
+		}
+		// CAMINO B: Si fue una medición automática por paso de caja real en la cinta
+		else {
+			uint8_t measure = 0;
+
+			/* Clasificación paramétrica dinámica (Tolerancias de Qt) */
+			if (manual_measured_distance >= min_6cm && manual_measured_distance <= max_6cm) { measure = 6; }
+			else if (manual_measured_distance >= min_8cm && manual_measured_distance <= max_8cm) { measure = 8; }
+			else if (manual_measured_distance >= min_10cm && manual_measured_distance <= max_10cm)  { measure = 10; }
+
+			if (measure != 0) {
+				lastboxtype = measure;
+				Ev.box_entry_active = 1;
+				
+				/* Inyección al protocolo de comunicaciones de la caja ya clasificada */
+				uint8_t payload[2];
+				 payload[0] = lastboxtype;
+				 payload[1] = manual_measured_distance;
+				SendSimuCMD(0x5F, &payload, 2);
+			}
 		}
 
 		/* Liberación incondicional de los recursos */
@@ -1129,6 +1155,21 @@ void Cmd_SensorEvent(void) {
     }
 }
 
+
+/*
+ * Cmd_Manual_measure indica que se hizo una peticion de medicion por ultrasónic (0x5F).
+ * payload[0] = boxType (6, 8 o 10).
+ * Acción: encolar el tipo de caja para que ClassifyBox pueda procesarla
+ * cuando llegue al sensor correspondiente.
+ */
+
+void Cmd_Manual_measure(void){
+	
+	Ev.manual_measure = 1;
+	Ev.reply_send_manual_measure = 1;
+	
+}
+
 /*
  * Cmd_NuevaCaja — Indica que una nueva caja fue medida en la cinta (0x5F).
  * payload[0] = boxType (6, 8 o 10).
@@ -1295,6 +1336,11 @@ void HandlePendingReplies(void) {
         Ev.reply_send_act_times_ack = 0;
         SendSimuCMD(0x62, NULL, 0); // Respondemos con 0x62 vacío para confirmar
     }
+	
+	if(Ev.manual_measure){
+		Ev.manual_measure = 0;
+		SendSimuCMD(0x63, &manual_measured_distance, 2);
+	}
 }
 /* ============================================================
  * TABLA DE COMANDOS
@@ -1311,6 +1357,8 @@ const _sCommand command_table[] = {
     { 0x50, Cmd_Start                 },   /* Arrancar la cinta */
     { 0x51, Cmd_AckStop               },   /* Detener la cinta */
     { 0x53, Cmd_AckReset              },   /* Reinicio de memoria y hardware */
+	{ 0x63, Cmd_Manual_measure        },
+	
 
     /* =========================================================
      * 2. MODOS DE OPERACIÓN Y CONFIGURACIÓN PARÁMETROS
