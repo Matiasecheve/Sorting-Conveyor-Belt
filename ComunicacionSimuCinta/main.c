@@ -81,11 +81,12 @@
 #define DEBUG_FAST_MS   100     /* Periodo toggle PB5 en ST_RUNNING       */
 #define MaxQueue        10      /* Maximo número de cajas en cinta        */
 #define DIST_SENSOR_TO_SERVO_MM  200  // Ajustá esto a la distancia real de tu cinta
-#define ANCHO_CAJA_CM      8UL
+#define ANCHO_CAJA_CM      10UL
 #define D0_CM              45UL
 #define D1_CM              88UL
 #define D2_CM              136UL
 #define KICK_FIFO_SIZE     5
+#define FACTOR_CORRECCION  125
 /* ============================================================
  * ENUMS
  * ============================================================ */
@@ -236,6 +237,9 @@ TCRT5000_t IrQ0    = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD3 };
 TCRT5000_t IrQ1    = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD4 };
 TCRT5000_t IrQ2    = { .mode = TCRT_DIGITAL, .pin_reg = &PIND, .pin_num = PD5 };
 
+
+
+
 void DoStartBotton();
 void DoStopBotton();
 void DoResetBotton();
@@ -329,14 +333,14 @@ uint8_t BeltVel;
 volatile uint16_t ActExtendMs = 300;
 volatile uint16_t ActDelayMs = 100;
 
-
-
 volatile uint8_t manual_measured_distance = 0;
+volatile uint16_t factor_corr_q100 = 133; // Por defecto arranca en 1.33 (133)
+
 
 /* Límites dinámicos del sensor ultrasónico (Configurables vía CMD 0x60) */
 volatile uint8_t min_6cm  = 14;
 volatile uint8_t max_6cm  = 15;
-volatile uint8_t min_8cm  = 11;  // Nota: Antes tu código usaba >6 (o sea 7). Ahora es ajustable.
+volatile uint8_t min_8cm  = 11;  
 volatile uint8_t max_8cm  = 13;
 volatile uint8_t min_10cm = 9;
 volatile uint8_t max_10cm = 11;
@@ -463,23 +467,23 @@ void HandleTimeMode(void){
 			 * AGENDAR PATADA (CINEMÁTICA EXACTA)
 			 * ========================================= */
 			if (target != 255) {
-				uint32_t dist_cm = 0;
-
-				switch(target){
-					case 0: dist_cm = D0_CM; break;
-					case 1: dist_cm = D1_CM; break;
-					case 2: dist_cm = D2_CM; break;
-				}
-
-				// Regla de tres simple para no perder precisión por truncamiento de enteros:
-				// Si en recorrer ANCHO_CAJA_CM tardó 'delta_t', ¿cuánto tarda en llegar al centro del servo?
-				uint32_t distancia_al_centro = dist_cm + (ANCHO_CAJA_CM / 2);
-				uint32_t t_vuelo_exacto = (distancia_al_centro * delta_t) / ANCHO_CAJA_CM;
-
-				// El cronómetro arranca desde el FLANCO DE BAJADA (ir_entry_fall_ts)
-				uint32_t ts_patada = ir_entry_fall_ts + t_vuelo_exacto;
-
+				uint32_t dist_cm = (target == 0) ? D0_CM : (target == 1) ? D1_CM : D2_CM;
+	
+				// 1. Calculamos el tiempo de vuelo ideal (D / V)
+				uint32_t distancia_total = dist_cm + (ANCHO_CAJA_CM / 2);
+				uint32_t t_vuelo_ideal = (distancia_total * 1000UL) / (BeltVel > 0 ? BeltVel : 1);
+	
+				// 2. Aplicamos el factor de corrección para "estirar" el tiempo (x 1.33)
+				uint32_t t_vuelo_corregido = (t_vuelo_ideal * factor_corr_q100) / 100;
+	
+				// 3. Agendamos la patada
+				uint32_t ts_patada = tick_ms + t_vuelo_corregido;
 				KickFIFO_Push(target, ts_patada);
+
+				// (Opcional) Te sugiero agregar este Debug para que veas en Qt el tiempo exacto que le sumó:
+				char dbg_msg[50];
+				sprintf(dbg_msg, "TIMEMODE: S%d Agendado. T.Vuelo: %lu ms", target, t_vuelo_ideal);
+				SendText(dbg_msg);
 			}
 
 			/* =========================================
@@ -647,11 +651,7 @@ void FireActuator(uint8_t outNum, uint8_t extend) {
     //PORTB |= (1 << PB1);
 }	
 
-/*
- * HandleActuators — Máquina de estados unificada para los 3 actuadores.
- * Se llama desde el loop principal (NO bloqueante).
- * Usa tick_ms para medir los tiempos de transición.
- */
+
 /*
  * HandleActuators — Máquina de estados unificada para los 3 actuadores.
  * Se llama desde el loop principal (NO bloqueante).
@@ -678,6 +678,9 @@ void HandleActuators(void) {
 			/* =================================================
 			 * ACT_IDLE (Reposo)
 			 * ================================================= */
+			/* =================================================
+			 * ACT_IDLE (Reposo)
+			 * ================================================= */
 			case ACT_IDLE:
 				// En MODO TIEMPO (0), el IDLE se encarga de revisar la agenda (FIFO)
 				if (Ev.isMode == 0) {
@@ -686,6 +689,13 @@ void HandleActuators(void) {
 						if ((int32_t)(now - kick_ts) >= 0) {
 							KickFIFO_Pop(i);          // Sacamos la caja de la lista
 							FireActuator(i, 1);       // Ordenamos patear
+							
+							// --- DEBUG DE EJECUCIÓN Y JITTER ---
+							char dbg_msg[50];
+							// (now - kick_ts) nos da el error de precisión en milisegundos
+							sprintf(dbg_msg, "TIMEMODE: S%d PATEO! (Latencia: %ld ms)", i, (int32_t)(now - kick_ts));
+							SendText(dbg_msg);
+
 							Actuator[i].state = ACT_EXTENDING;
 							Actuator[i].timestamp_ms = now;
 							
@@ -741,7 +751,6 @@ void HandleActuators(void) {
 /* ============================================================
  * INFRARROJOS
  * ============================================================ */
-
 void HandlePhysicalIRs(void){
 	
 	// --- BLOQUEO DE SEGURIDAD: Si la cinta está detenida, se congela la matriz ---
@@ -825,36 +834,41 @@ void HCSR04(void) {
 	if (SensorCajas.state == HCSR_DATA_READY) {
 		uint16_t cm = SensorCajas.distancia;
 
-		// --- ¡NUEVO! TELEMETRÍA CRUDA INCONDICIONAL ---
-		// Enviamos siempre la lectura cruda al log de Qt para ver exactamente qué lee el sensor.
-		char debug_msg[3];
-		sprintf(debug_msg, "%u", cm);
+		// --- TELEMETRÍA CRUDA INCONDICIONAL ---
+		char debug_msg[40]; // Agrandado para evitar Stack Overflow
+		sprintf(debug_msg, "HCSR04: LECTURA FISICA = %u cm", cm);
 		SendText(debug_msg);
 
 		// CAMINO A: Si fue una solicitud MANUAL desde el botón "Medir" de Qt
 		if (Ev.manual_measure) {
-			Ev.manual_measure = 0; // Bajamos la bandera de control
+			Ev.manual_measure = 0; // Bajamos la bandera
+			
 			uint8_t payload_manual = (uint8_t)cm;
-			SendSimuCMD(0x63, &payload_manual, 1); // Respondemos con la distancia exacta
+			SendSimuCMD(0x63, &payload_manual, 1);
 		}
-		// CAMINO B: Si fue una medición automática por paso de caja real en la cinta
+		// CAMINO B: Si fue una medición AUTOMÁTICA por paso de caja real
 		else {
 			uint8_t measure = 0;
 
 			/* Clasificación paramétrica dinámica (Tolerancias de Qt) */
-			if (manual_measured_distance >= min_6cm && manual_measured_distance <= max_6cm) { measure = 6; }
-			else if (manual_measured_distance >= min_8cm && manual_measured_distance <= max_8cm) { measure = 8; }
-			else if (manual_measured_distance >= min_10cm && manual_measured_distance <= max_10cm)  { measure = 10; }
+			if (cm >= min_6cm && cm <= max_6cm) { measure = 6; }
+			else if (cm >= min_8cm && cm <= max_8cm) { measure = 8; }
+			else if (cm >= min_10cm && cm <= max_10cm)  { measure = 10; }
 
 			if (measure != 0) {
 				lastboxtype = measure;
 				Ev.box_entry_active = 1;
 				
-				/* Inyección al protocolo de comunicaciones de la caja ya clasificada */
-				uint8_t payload[2];
-				 payload[0] = lastboxtype;
-				 payload[1] = manual_measured_distance;
-				SendSimuCMD(0x5F, &payload, 2);
+				/* Inyección al protocolo: [Tamaño Clasificado] + [Centímetros Reales] */
+				uint8_t payload_auto[2];
+				payload_auto[0] = lastboxtype;
+				payload_auto[1] = (uint8_t)cm; // Asignamos la lectura real
+				
+				// 0x5F usa 2 bytes. OJO: SIN el "&" porque payload_auto ya es un array
+				SendSimuCMD(0x5F, payload_auto, 2);
+				} else {
+				// Te avisa por Qt si la caja no fue de 6, 8 o 10
+				SendText("SISTEMA: Caja ignorada (Medida fuera de tolerancias)");
 			}
 		}
 
@@ -866,6 +880,14 @@ void HCSR04(void) {
  * CALLBACKS DE COMANDOS (RX desde el simulador)
  * ============================================================ */
 
+void Cmd_SetCorrectionFactor(void) {
+	if (Rx.payloadLen >= 2) {
+		factor_corr_q100 = (uint16_t)Rx.payload[0] | ((uint16_t)Rx.payload[1] << 8);
+		
+		// Enviamos un comando vacío de vuelta para generar el ACK en Qt
+		SendSimuCMD(0x64, NULL, 0);
+	}
+}
 /*
  * Cmd_SetActuatorTimes — (0x62 SIMU->MICRO).
  * Payload: [ExtLow][ExtHigh][DelLow][DelHigh]
@@ -1371,6 +1393,7 @@ const _sCommand command_table[] = {
 	{0x57, Cmd_SetWaitCenter          },	
 	{ 0x60, Cmd_Calibracion           },   /* Calibración del Sensor Ultrasónico */
 	{ 0x62, Cmd_SetActuatorTimes      },   /* NUEVO: Configurar tiempos de servo */
+	{ 0x64, Cmd_SetCorrectionFactor   },
     /* =========================================================
      * 3. EVENTOS DE HARDWARE Y SENSORES (SIMULADOS O FÍSICOS)
      * ========================================================= */
@@ -1751,6 +1774,10 @@ void Inject_RX_Command(const uint8_t *trama, uint8_t len) {
  */
 ISR(TIMER0_COMPA_vect) {
     tick_ms += 2;
+	
+	
+	
+	
 }
 
 /* ============================================================
@@ -1827,7 +1854,9 @@ int main(void) {
      * IrQ1:    PD4 (antes PC2)
      * IrQ2:    PD5 (antes PC3)
      * ============================================================ */
-    TCRT5000_Init(&IrEntry);
+	
+	
+	TCRT5000_Init(&IrEntry);
     TCRT5000_Init(&IrQ0);
     TCRT5000_Init(&IrQ1);
     TCRT5000_Init(&IrQ2);
